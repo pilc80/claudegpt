@@ -3,6 +3,8 @@ use std::collections::HashMap;
 use anyhow::Result;
 use serde_json::{json, Value};
 
+use crate::proxy::translate::tool_id;
+use crate::proxy::translate::tool_text_parser::parse_textual_tool_call;
 use crate::proxy::util::{truncate_tool_name, ToolNameMap};
 
 /// Convert Anthropic Messages API request → OpenAI Chat Completions request
@@ -58,7 +60,7 @@ pub fn anthropic_to_openai(
                                         let result_text = extract_tool_result_content(block);
                                         messages.push(json!({
                                             "role": "tool",
-                                            "tool_call_id": call_id,
+                                            "tool_call_id": tool_id::to_upstream_tool_id(call_id),
                                             "content": result_text,
                                         }));
                                     }
@@ -118,7 +120,7 @@ pub fn anthropic_to_openai(
                                         tool_name_map.insert(truncated.clone(), orig.to_string());
                                     }
                                     tool_calls.push(json!({
-                                        "id": block.get("id").unwrap_or(&json!("")),
+                                        "id": block.get("id").and_then(|v| v.as_str()).map(tool_id::to_upstream_tool_id).unwrap_or_default(),
                                         "type": "function",
                                         "function": {
                                             "name": truncated,
@@ -155,6 +157,8 @@ pub fn anthropic_to_openai(
             }
         }
     }
+
+    messages = normalize_system_messages(messages);
 
     let model = anthropic
         .get("model")
@@ -223,6 +227,32 @@ pub fn anthropic_to_openai(
     Ok((openai_req, tool_name_map))
 }
 
+fn normalize_system_messages(messages: Vec<Value>) -> Vec<Value> {
+    let mut system_parts = Vec::new();
+    let mut non_system = Vec::new();
+
+    for msg in messages {
+        if msg.get("role").and_then(|r| r.as_str()) == Some("system") {
+            let content = msg.get("content").unwrap_or(&Value::Null);
+            let text = content_to_string(content);
+            if !text.is_empty() {
+                system_parts.push(text);
+            }
+        } else {
+            non_system.push(msg);
+        }
+    }
+
+    if system_parts.is_empty() {
+        return non_system;
+    }
+
+    let mut normalized = Vec::with_capacity(non_system.len() + 1);
+    normalized.push(json!({"role": "system", "content": system_parts.join("\n\n")}));
+    normalized.extend(non_system);
+    normalized
+}
+
 fn strip_context_window_suffix(model: &str) -> &str {
     model
         .strip_suffix("[1m]")
@@ -255,6 +285,7 @@ pub fn openai_to_anthropic(openai: &Value, tool_name_map: &ToolNameMap) -> Resul
     }
 
     // Tool calls（还原被截断的工具名）
+    let mut has_tool_call = false;
     if let Some(tool_calls) = message.get("tool_calls").and_then(|tc| tc.as_array()) {
         for tc in tool_calls {
             let empty_func = json!({});
@@ -273,12 +304,28 @@ pub fn openai_to_anthropic(openai: &Value, tool_name_map: &ToolNameMap) -> Resul
                 .unwrap_or(truncated_name);
             let input = sanitize_tool_input(original_name, input);
 
+            has_tool_call = true;
             content.push(json!({
                 "type": "tool_use",
-                "id": tc.get("id").unwrap_or(&json!("")),
+                "id": tc.get("id").and_then(|v| v.as_str()).map(tool_id::to_anthropic_tool_id).unwrap_or_default(),
                 "name": original_name,
                 "input": input,
             }));
+        }
+    }
+
+    if !has_tool_call && content.len() == 1 {
+        if let Some(text) = content[0].get("text").and_then(|value| value.as_str()) {
+            if let Some(parsed) = parse_textual_tool_call(text) {
+                let input = sanitize_tool_input(&parsed.name, parsed.input);
+                content[0] = json!({
+                    "type": "tool_use",
+                    "id": tool_id::to_anthropic_tool_id("call_text_1"),
+                    "name": parsed.name,
+                    "input": input,
+                });
+                has_tool_call = true;
+            }
         }
     }
 
@@ -311,6 +358,12 @@ pub fn openai_to_anthropic(openai: &Value, tool_name_map: &ToolNameMap) -> Resul
         .get("model")
         .and_then(|m| m.as_str())
         .unwrap_or("unknown");
+
+    let stop_reason = if has_tool_call {
+        "tool_use"
+    } else {
+        stop_reason
+    };
 
     let resp = json!({
         "id": openai.get("id").unwrap_or(&json!("msg_claudex")),
@@ -499,6 +552,23 @@ mod tests {
         });
         let result = a2o(&req, "m");
         assert_eq!(result["messages"][0]["content"], "Part 1\nPart 2");
+    }
+
+    #[test]
+    fn test_system_messages_are_merged_at_beginning() {
+        let req = json!({
+            "system": "Root system.",
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "system", "content": "Hook system."}
+            ]
+        });
+        let result = a2o(&req, "m");
+        let msgs = result["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[0]["role"], "system");
+        assert_eq!(msgs[0]["content"], "Root system.\n\nHook system.");
+        assert_eq!(msgs[1]["role"], "user");
     }
 
     #[test]
@@ -809,7 +879,7 @@ mod tests {
         let result = openai_to_anthropic(&resp, &empty_map()).unwrap();
         assert_eq!(result["stop_reason"], "tool_use");
         assert_eq!(result["content"][0]["type"], "tool_use");
-        assert_eq!(result["content"][0]["id"], "call_abc");
+        assert_eq!(result["content"][0]["id"], "toolu_call_abc");
         assert_eq!(result["content"][0]["name"], "get_weather");
         assert_eq!(result["content"][0]["input"]["city"], "Tokyo");
     }
@@ -922,6 +992,20 @@ mod tests {
     }
 
     #[test]
+    fn test_chat_completions_textual_tool_call() {
+        let resp = json!({
+            "model": "gpt-5.5",
+            "choices": [{"message": {"content": "Read({\"file_path\":\"/tmp/a.md\",\"pages\":\"\"})"}, "finish_reason": "stop"}],
+            "usage": {}
+        });
+        let result = openai_to_anthropic(&resp, &empty_map()).unwrap();
+        assert_eq!(result["stop_reason"], "tool_use");
+        assert_eq!(result["content"][0]["type"], "tool_use");
+        assert_eq!(result["content"][0]["id"], "toolu_call_text_1");
+        assert!(result["content"][0]["input"].get("pages").is_none());
+    }
+
+    #[test]
     fn test_tool_name_roundtrip() {
         let long_name = "mcp__claude_in_chrome__validate_and_render_mermaid_diagram_extra_long";
         let req = json!({
@@ -937,6 +1021,7 @@ mod tests {
         assert!(truncated.len() <= 64);
 
         // 模拟 OpenAI 返回截断名
+
         let resp = json!({
             "choices": [{
                 "message": {

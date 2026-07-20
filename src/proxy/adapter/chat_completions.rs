@@ -18,9 +18,20 @@ impl ProviderAdapter for ChatCompletionsAdapter {
         body: &Value,
         profile: &ProfileConfig,
     ) -> Result<TranslatedRequest> {
+        let mut body = body.clone();
+        let warnings =
+            crate::proxy::translate::fixers::apply_openai_compatibility_fixers(&mut body);
+        for warning in warnings.iter() {
+            tracing::warn!(
+                profile = %profile.name,
+                code = warning.code,
+                message = %warning.message,
+                "applied OpenAI-compatible request fixer"
+            );
+        }
         let (openai_body, tool_name_map) =
             crate::proxy::translate::chat_completions::anthropic_to_openai(
-                body,
+                &body,
                 &profile.default_model,
                 profile.max_tokens,
             )?;
@@ -64,10 +75,16 @@ impl ProviderAdapter for ChatCompletionsAdapter {
         crate::proxy::translate::chat_completions::openai_to_anthropic(body, tool_name_map)
     }
 
-    fn translate_stream(&self, stream: ByteStream, tool_name_map: ToolNameMap) -> ByteStream {
-        crate::proxy::translate::chat_completions_stream::translate_sse_stream(
+    fn translate_stream(
+        &self,
+        stream: ByteStream,
+        tool_name_map: ToolNameMap,
+        profile: &ProfileConfig,
+    ) -> ByteStream {
+        crate::proxy::translate::chat_completions_stream::translate_sse_stream_with_reasoning(
             stream,
             tool_name_map,
+            profile.reasoning_bridge,
         )
     }
 }

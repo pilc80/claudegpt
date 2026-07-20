@@ -5,6 +5,7 @@ use std::time::{Duration, Instant};
 use axum::body::Body;
 use axum::extract::rejection::BytesRejection;
 use axum::extract::{Path, State};
+use axum::http::response::Builder as ResponseBuilder;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
@@ -70,6 +71,82 @@ impl std::fmt::Display for TranslatedProxyError {
 }
 
 impl std::error::Error for TranslatedProxyError {}
+
+pub async fn handle_count_tokens_root(body: Result<axum::body::Bytes, BytesRejection>) -> Response {
+    count_tokens_response(body)
+}
+
+pub async fn handle_count_tokens(
+    Path(_profile_name): Path<String>,
+    body: Result<axum::body::Bytes, BytesRejection>,
+) -> Response {
+    count_tokens_response(body)
+}
+
+fn count_tokens_response(body: Result<axum::body::Bytes, BytesRejection>) -> Response {
+    let body = match body {
+        Ok(body) => body,
+        Err(err) => {
+            return (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                format!("request body too large or unreadable before token counting: {err}"),
+            )
+                .into_response();
+        }
+    };
+
+    let value: Value = match serde_json::from_slice(&body) {
+        Ok(value) => value,
+        Err(err) => {
+            return (StatusCode::BAD_REQUEST, format!("invalid JSON: {err}")).into_response()
+        }
+    };
+
+    let input_tokens = estimate_anthropic_input_tokens(&value);
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "application/json")
+        .body(Body::from(
+            json!({"input_tokens": input_tokens}).to_string(),
+        ))
+        .unwrap_or_else(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to build response",
+            )
+                .into_response()
+        })
+}
+
+fn estimate_anthropic_input_tokens(value: &Value) -> u64 {
+    let mut chars = 0usize;
+    collect_anthropic_input_chars(value.get("system"), &mut chars);
+    collect_anthropic_input_chars(value.get("messages"), &mut chars);
+    collect_anthropic_input_chars(value.get("tools"), &mut chars);
+    collect_anthropic_input_chars(value.get("tool_choice"), &mut chars);
+    collect_anthropic_input_chars(value.get("output_config"), &mut chars);
+    ((chars as u64).saturating_add(3) / 4).max(1)
+}
+
+fn collect_anthropic_input_chars(value: Option<&Value>, chars: &mut usize) {
+    let Some(value) = value else {
+        return;
+    };
+    match value {
+        Value::String(text) => *chars += text.chars().count(),
+        Value::Array(items) => {
+            for item in items {
+                collect_anthropic_input_chars(Some(item), chars);
+            }
+        }
+        Value::Object(obj) => {
+            for item in obj.values() {
+                collect_anthropic_input_chars(Some(item), chars);
+            }
+        }
+        Value::Bool(_) | Value::Number(_) | Value::Null => *chars += value.to_string().len(),
+    }
+}
 
 pub async fn handle_messages(
     State(state): State<Arc<ProxyState>>,
@@ -477,8 +554,24 @@ async fn try_forward(
     let adapter = super::adapter::for_provider(&profile.provider_type);
     let mut body_for_translation = body.clone();
     apply_metadata_from_headers(&mut body_for_translation, headers, profile);
+    let context_telemetry =
+        apply_openai_compatible_auto_compact(&mut body_for_translation, profile);
+    super::file_cache::apply_provider_file_cache(
+        &state.http_client,
+        &state.file_cache,
+        profile,
+        &mut body_for_translation,
+    )
+    .await;
     let mut translated = adapter.translate_request(&body_for_translation, profile)?;
     adapter.filter_translated_body(&mut translated.body, profile);
+    super::models::repair_model_case(
+        &state.http_client,
+        &state.model_cache,
+        profile,
+        &mut translated.body,
+    )
+    .await;
     let compact_request =
         apply_compact_prompt_overrides(&body_for_translation, &mut translated.body);
     let translated_model = translated
@@ -790,7 +883,7 @@ async fn try_forward(
 
                 let (stream, upstream_capture) = capture_stream(preflight.stream);
                 let translated_stream =
-                    adapter.translate_stream(Box::pin(stream), translated.tool_name_map);
+                    adapter.translate_stream(Box::pin(stream), translated.tool_name_map, profile);
                 let dumped_stream = dump_claude_stream_errors(
                     translated_stream,
                     profile.name.clone(),
@@ -800,7 +893,7 @@ async fn try_forward(
                     upstream_capture,
                     compact_request,
                 );
-                let response = Response::builder()
+                let response = response_builder_with_context_telemetry(&context_telemetry)
                     .status(200)
                     .header("content-type", "text/event-stream")
                     .header("cache-control", "no-cache")
@@ -811,7 +904,7 @@ async fn try_forward(
 
             let (stream, upstream_capture) = capture_stream(stream);
             let translated_stream =
-                adapter.translate_stream(Box::pin(stream), translated.tool_name_map);
+                adapter.translate_stream(Box::pin(stream), translated.tool_name_map, profile);
             let dumped_stream = dump_claude_stream_errors(
                 translated_stream,
                 profile.name.clone(),
@@ -821,7 +914,7 @@ async fn try_forward(
                 upstream_capture,
                 false,
             );
-            let response = Response::builder()
+            let response = response_builder_with_context_telemetry(&context_telemetry)
                 .status(200)
                 .header("content-type", "text/event-stream")
                 .header("cache-control", "no-cache")
@@ -844,13 +937,216 @@ async fn try_forward(
                 );
             }
             extract_and_store_context(state, &profile.name, &anthropic_resp);
-            let response = Response::builder()
+            let response = response_builder_with_context_telemetry(&context_telemetry)
                 .status(200)
                 .header("content-type", "application/json")
                 .body(Body::from(serde_json::to_vec(&anthropic_resp)?))
                 .map_err(|e| anyhow::anyhow!("failed to build response: {e}"))?;
             Ok(response)
         }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct ContextTelemetry {
+    before_tokens: u64,
+    after_tokens: u64,
+    truncated: bool,
+    summary: &'static str,
+    removed_messages: usize,
+    reserve_tokens: u64,
+}
+
+impl ContextTelemetry {
+    fn active(&self) -> bool {
+        self.before_tokens > 0 || self.after_tokens > 0 || self.removed_messages > 0
+    }
+}
+
+fn response_builder_with_context_telemetry(
+    telemetry: &Option<ContextTelemetry>,
+) -> ResponseBuilder {
+    let mut builder = Response::builder();
+    let Some(telemetry) = telemetry.as_ref().filter(|telemetry| telemetry.active()) else {
+        return builder;
+    };
+    builder = builder.header(
+        "x-claudex-context-before-tokens",
+        telemetry.before_tokens.to_string(),
+    );
+    builder = builder.header(
+        "x-claudex-context-after-tokens",
+        telemetry.after_tokens.to_string(),
+    );
+    builder = builder.header(
+        "x-claudex-context-truncated",
+        telemetry.truncated.to_string(),
+    );
+    builder = builder.header("x-claudex-context-summary", telemetry.summary);
+    builder = builder.header(
+        "x-claudex-context-removed-messages",
+        telemetry.removed_messages.to_string(),
+    );
+    builder.header(
+        "x-claudex-context-reserve-tokens",
+        telemetry.reserve_tokens.to_string(),
+    )
+}
+
+fn apply_openai_compatible_auto_compact(
+    body: &mut Value,
+    profile: &ProfileConfig,
+) -> Option<ContextTelemetry> {
+    if profile.provider_type != ProviderType::OpenAICompatible
+        || !profile.openai_compatible_auto_compact.enabled
+    {
+        return None;
+    }
+    let before_tokens = estimate_anthropic_input_tokens(body);
+    let reserve_tokens = profile.openai_compatible_auto_compact.reserve_tokens;
+    let max_items = profile.openai_compatible_auto_compact.max_items.max(1);
+    let mut removed_messages = 0usize;
+    let mut summary = "none";
+    if before_tokens > reserve_tokens {
+        if let Some(messages) = body
+            .get_mut("messages")
+            .and_then(|value| value.as_array_mut())
+        {
+            let keep_from = safe_compaction_keep_from(messages, max_items);
+            if keep_from > 0 {
+                removed_messages = keep_from;
+                messages.drain(0..keep_from);
+                summary = "truncated";
+                messages.insert(0, json!({
+                    "role": "user",
+                    "content": [{
+                        "type": "text",
+                        "text": format!("[claudex auto-compaction notice: omitted {} older message(s) before forwarding to OpenAI-compatible backend]", removed_messages)
+                    }]
+                }));
+            }
+        }
+    }
+    let after_tokens = estimate_anthropic_input_tokens(body);
+    let telemetry = ContextTelemetry {
+        before_tokens,
+        after_tokens,
+        truncated: removed_messages > 0,
+        summary,
+        removed_messages,
+        reserve_tokens,
+    };
+    tracing::info!(
+        profile = %profile.name,
+        before_tokens,
+        after_tokens,
+        truncated = telemetry.truncated,
+        summary,
+        removed_messages,
+        reserve_tokens,
+        "OpenAICompatible auto-compaction evaluated"
+    );
+    Some(telemetry)
+}
+
+fn safe_compaction_keep_from(messages: &[Value], max_items: usize) -> usize {
+    if messages.len() <= max_items {
+        return 0;
+    }
+    let target = messages.len().saturating_sub(max_items);
+    let protected_tool_results = tool_result_ids_in_messages(&messages[target..]);
+    let mut keep_from = target;
+    while keep_from > 0
+        && prefix_contains_tool_use_for(&messages[..keep_from], &protected_tool_results)
+    {
+        keep_from -= 1;
+    }
+    keep_from
+}
+
+fn tool_result_ids_in_messages(messages: &[Value]) -> std::collections::HashSet<String> {
+    let mut ids = std::collections::HashSet::new();
+    for message in messages {
+        collect_tool_result_ids(message.get("content"), &mut ids);
+    }
+    ids
+}
+
+fn collect_tool_result_ids(value: Option<&Value>, ids: &mut std::collections::HashSet<String>) {
+    let Some(value) = value else {
+        return;
+    };
+    match value {
+        Value::Object(obj) => {
+            if obj.get("type").and_then(|value| value.as_str()) == Some("tool_result") {
+                if let Some(id) = obj.get("tool_use_id").and_then(|value| value.as_str()) {
+                    ids.insert(id.to_string());
+                }
+            }
+            collect_tool_result_ids(obj.get("content"), ids);
+        }
+        Value::Array(items) => {
+            for item in items {
+                collect_tool_result_ids(Some(item), ids);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn prefix_contains_tool_use_for(
+    messages: &[Value],
+    tool_result_ids: &std::collections::HashSet<String>,
+) -> bool {
+    !tool_result_ids.is_empty()
+        && messages
+            .iter()
+            .any(|message| content_contains_tool_use_for(message.get("content"), tool_result_ids))
+}
+
+fn content_contains_tool_use_for(
+    value: Option<&Value>,
+    tool_result_ids: &std::collections::HashSet<String>,
+) -> bool {
+    let Some(value) = value else {
+        return false;
+    };
+    match value {
+        Value::Object(obj) => {
+            if obj.get("type").and_then(|value| value.as_str()) == Some("tool_use") {
+                if let Some(id) = obj.get("id").and_then(|value| value.as_str()) {
+                    if tool_result_ids.contains(id) {
+                        return true;
+                    }
+                }
+            }
+            content_contains_tool_use_for(obj.get("content"), tool_result_ids)
+        }
+        Value::Array(items) => items
+            .iter()
+            .any(|item| content_contains_tool_use_for(Some(item), tool_result_ids)),
+        _ => false,
+    }
+}
+
+fn message_contains_tool_result(message: &Value) -> bool {
+    let Some(content) = message.get("content") else {
+        return false;
+    };
+    content_contains_tool_result(content)
+}
+
+fn content_contains_tool_result(value: &Value) -> bool {
+    match value {
+        Value::Object(obj) => {
+            obj.get("type").and_then(|value| value.as_str()) == Some("tool_result")
+                || match obj.get("content") {
+                    Some(content) => content_contains_tool_result(content),
+                    None => false,
+                }
+        }
+        Value::Array(items) => items.iter().any(content_contains_tool_result),
+        _ => false,
     }
 }
 
@@ -2431,6 +2727,8 @@ mod tests {
             shared_context: crate::context::sharing::SharedContext::new(),
             rag_index: None,
             token_manager: crate::oauth::manager::TokenManager::new(reqwest::Client::new()),
+            model_cache: crate::proxy::models::new_model_cache(),
+            file_cache: crate::proxy::file_cache::new_provider_file_cache(),
         };
         let profile = ProfileConfig {
             name: "dead-local".to_string(),
@@ -2835,6 +3133,150 @@ mod tests {
     }
 
     #[test]
+    fn test_openai_compatible_auto_compact_trims_old_messages() {
+        let mut body = json!({
+            "messages": [
+                {"role":"user","content":"old1"},
+                {"role":"assistant","content":"old2"},
+                {"role":"user","content":"new"}
+            ]
+        });
+        let profile = ProfileConfig {
+            provider_type: ProviderType::OpenAICompatible,
+            openai_compatible_auto_compact: crate::config::OpenAICompatibleAutoCompact {
+                enabled: true,
+                max_items: 1,
+                reserve_tokens: 1,
+            },
+            ..ProfileConfig::default()
+        };
+        let telemetry = apply_openai_compatible_auto_compact(&mut body, &profile).unwrap();
+        assert_eq!(telemetry.removed_messages, 2);
+        assert!(telemetry.truncated);
+        assert_eq!(telemetry.summary, "truncated");
+        assert_eq!(telemetry.reserve_tokens, 1);
+        assert!(
+            body["messages"].as_array().unwrap().last().unwrap()["content"]
+                .to_string()
+                .contains("new")
+        );
+    }
+
+    #[test]
+    fn test_auto_compact_respects_context_limit_and_tool_result_boundaries() {
+        let mut body = json!({
+            "messages": [
+                {"role":"user","content":"old"},
+                {"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Read","input":{"file_path":"/tmp/a.md"}}]},
+                {"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"result"}]},
+                {"role":"user","content":"new"}
+            ]
+        });
+        let profile = ProfileConfig {
+            provider_type: ProviderType::OpenAICompatible,
+            openai_compatible_auto_compact: crate::config::OpenAICompatibleAutoCompact {
+                enabled: true,
+                max_items: 2,
+                reserve_tokens: 1,
+            },
+            ..ProfileConfig::default()
+        };
+
+        let telemetry = apply_openai_compatible_auto_compact(&mut body, &profile).unwrap();
+
+        assert_eq!(telemetry.removed_messages, 1);
+        let messages = body["messages"].as_array().unwrap();
+        assert!(messages[1]["content"].to_string().contains("toolu_1"));
+        assert!(messages[2]["content"].to_string().contains("tool_result"));
+    }
+
+    #[test]
+    fn test_auto_compact_keeps_tool_use_for_retained_tool_result() {
+        let mut body = json!({
+            "messages": [
+                {"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Read","input":{"file_path":"/tmp/a.md"}}]},
+                {"role":"user","content":"normal"},
+                {"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"result"}]},
+                {"role":"user","content":"new"}
+            ]
+        });
+        let profile = ProfileConfig {
+            provider_type: ProviderType::OpenAICompatible,
+            openai_compatible_auto_compact: crate::config::OpenAICompatibleAutoCompact {
+                enabled: true,
+                max_items: 2,
+                reserve_tokens: 1,
+            },
+            ..ProfileConfig::default()
+        };
+
+        let telemetry = apply_openai_compatible_auto_compact(&mut body, &profile).unwrap();
+
+        assert_eq!(telemetry.removed_messages, 0);
+        let rendered = body["messages"].to_string();
+        assert!(rendered.contains("tool_use"));
+        assert!(rendered.contains("tool_result"));
+    }
+
+    #[test]
+    fn test_auto_compact_skips_when_under_context_limit() {
+        let mut body = json!({"messages": [
+            {"role":"user","content":"old"},
+            {"role":"user","content":"new"}
+        ]});
+        let profile = ProfileConfig {
+            provider_type: ProviderType::OpenAICompatible,
+            openai_compatible_auto_compact: crate::config::OpenAICompatibleAutoCompact {
+                enabled: true,
+                max_items: 1,
+                reserve_tokens: 10_000,
+            },
+            ..ProfileConfig::default()
+        };
+
+        let telemetry = apply_openai_compatible_auto_compact(&mut body, &profile).unwrap();
+
+        assert_eq!(telemetry.removed_messages, 0);
+        assert!(!telemetry.truncated);
+        assert_eq!(body["messages"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn test_auto_compact_skips_responses_profiles() {
+        let mut body =
+            json!({"messages": [{"role":"user","content":"old"},{"role":"user","content":"new"}]});
+        let profile = ProfileConfig {
+            provider_type: ProviderType::OpenAIResponses,
+            openai_compatible_auto_compact: crate::config::OpenAICompatibleAutoCompact {
+                enabled: true,
+                max_items: 1,
+                reserve_tokens: 123,
+            },
+            ..ProfileConfig::default()
+        };
+        assert!(apply_openai_compatible_auto_compact(&mut body, &profile).is_none());
+        assert_eq!(body["messages"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn test_context_telemetry_headers() {
+        let telemetry = Some(ContextTelemetry {
+            before_tokens: 10,
+            after_tokens: 5,
+            truncated: true,
+            summary: "generated",
+            removed_messages: 2,
+            reserve_tokens: 123,
+        });
+        let response = response_builder_with_context_telemetry(&telemetry)
+            .status(200)
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(response.headers()["x-claudex-context-before-tokens"], "10");
+        assert_eq!(response.headers()["x-claudex-context-summary"], "generated");
+    }
+
+    #[test]
     fn test_apply_metadata_from_headers_sets_session_id() {
         let mut body = json!({"messages": []});
         let mut headers = HeaderMap::new();
@@ -2863,6 +3305,26 @@ mod tests {
         apply_metadata_from_headers(&mut body, &headers, &profile);
 
         assert_eq!(body, original);
+    }
+
+    #[test]
+    fn count_tokens_estimator_counts_text_and_tools() {
+        let body = json!({
+            "system": [{"type": "text", "text": "You are helpful."}],
+            "messages": [{"role": "user", "content": [{"type": "text", "text": "Hello world"}]}],
+            "tools": [{
+                "name": "lookup",
+                "description": "Lookup a value",
+                "input_schema": {"type": "object", "properties": {"q": {"type": "string"}}}
+            }]
+        });
+
+        assert!(estimate_anthropic_input_tokens(&body) > 10);
+    }
+
+    #[test]
+    fn count_tokens_estimator_never_returns_zero() {
+        assert_eq!(estimate_anthropic_input_tokens(&json!({})), 1);
     }
 
     #[test]

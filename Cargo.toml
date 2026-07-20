@@ -1,6 +1,6 @@
 [package]
 name = "claudex"
-version = "0.9.53"
+version = "0.9.61"
 edition = "2021"
 autobins = false
 description = "ChatGPT/Codex OAuth for Claude Code without an API key"
@@ -31,7 +31,7 @@ tower = "0.5"
 tower-http = { version = "0.6", features = ["cors", "trace"] }
 
 # HTTP client
-reqwest = { version = "0.13", features = ["json", "stream", "form", "rustls"], default-features = false }
+reqwest = { version = "0.13", features = ["json", "stream", "form", "multipart", "rustls"], default-features = false }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }

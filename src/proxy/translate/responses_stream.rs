@@ -4,7 +4,9 @@ use serde_json::{json, Value};
 use std::error::Error;
 use std::pin::Pin;
 
+use crate::config::ReasoningBridge;
 use crate::proxy::error_translation::{self, AnthropicError};
+use crate::proxy::translate::{tool_id, tool_text_parser::parse_textual_tool_call};
 use crate::proxy::util::{format_sse, ToolNameMap};
 
 const UPSTREAM_STREAM_READ_TIMEOUT_SECS: u64 = 300;
@@ -20,7 +22,19 @@ pub fn translate_responses_stream<S>(
 where
     S: Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static,
 {
+    translate_responses_stream_with_reasoning(input, tool_name_map, ReasoningBridge::Off)
+}
+
+pub fn translate_responses_stream_with_reasoning<S>(
+    input: S,
+    tool_name_map: ToolNameMap,
+    reasoning_bridge: ReasoningBridge,
+) -> Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send>>
+where
+    S: Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static,
+{
     let mut state = ResponsesStreamState::new(tool_name_map);
+    state.reasoning_bridge = reasoning_bridge;
 
     let output = async_stream::stream! {
         let mut stream = std::pin::pin!(input);
@@ -76,6 +90,16 @@ where
                     yield Ok(Bytes::from(event));
                     return;
                 }
+                if !message_started {
+                    yield Ok(Bytes::from(message_start_event()));
+                    message_started = true;
+                }
+                yield Ok(Bytes::from(event));
+            }
+        }
+
+        if !state.buffered_text.is_empty() {
+            for event in state.flush_buffered_text_or_tool() {
                 if !message_started {
                     yield Ok(Bytes::from(message_start_event()));
                     message_started = true;
@@ -289,6 +313,8 @@ struct ResponsesStreamState {
     current_tool_arguments_buffer: String,
     current_tool_saw_argument_delta: bool,
     verification_recommendation: Option<String>,
+    reasoning_bridge: ReasoningBridge,
+    buffered_text: String,
 }
 
 impl ResponsesStreamState {
@@ -310,6 +336,8 @@ impl ResponsesStreamState {
             current_tool_arguments_buffer: String::new(),
             current_tool_saw_argument_delta: false,
             verification_recommendation: None,
+            reasoning_bridge: ReasoningBridge::Off,
+            buffered_text: String::new(),
         }
     }
 
@@ -385,11 +413,13 @@ impl ResponsesStreamState {
                 if delta.is_empty() {
                     return vec![];
                 }
-                self.saw_text_delta = true;
-
                 let mut events = Vec::new();
-
-                // Start content block if not started
+                if !self.block_started
+                    && should_buffer_textual_tool_candidate(&self.buffered_text, delta)
+                {
+                    self.buffered_text.push_str(delta);
+                    return events;
+                }
                 if !self.block_started {
                     events.push(format_sse(
                         "content_block_start",
@@ -401,7 +431,7 @@ impl ResponsesStreamState {
                     ));
                     self.block_started = true;
                 }
-
+                self.saw_text_delta = true;
                 events.push(format_sse(
                     "content_block_delta",
                     &json!({
@@ -410,10 +440,27 @@ impl ResponsesStreamState {
                         "delta": {"type": "text_delta", "text": delta},
                     }),
                 ));
-
                 events
             }
             "response.output_text.done" | "response.content_part.done" => {
+                if let Some(full_text) = json.get("text").and_then(|value| value.as_str()) {
+                    if self.buffered_text.is_empty() {
+                        if parse_textual_tool_call(full_text).is_some() {
+                            self.buffered_text = full_text.to_string();
+                            return self.flush_buffered_text_or_tool();
+                        }
+                        if !full_text.is_empty() && !self.block_started {
+                            return self.emit_text_block(full_text);
+                        }
+                    } else if parse_textual_tool_call(&self.buffered_text).is_none()
+                        && parse_textual_tool_call(full_text).is_some()
+                    {
+                        self.buffered_text = full_text.to_string();
+                    }
+                }
+                if !self.buffered_text.is_empty() {
+                    return self.flush_buffered_text_or_tool();
+                }
                 if self.block_started {
                     self.block_started = false;
                     let event = format_sse(
@@ -431,6 +478,15 @@ impl ResponsesStreamState {
             "response.output_item.done" => {
                 let empty = json!({});
                 let item = json.get("item").unwrap_or(&empty);
+                if item.get("type").and_then(|t| t.as_str()) == Some("reasoning") {
+                    if self.reasoning_bridge == ReasoningBridge::VisibleThinking {
+                        let text = extract_reasoning_summary(item);
+                        if !text.is_empty() {
+                            return self.emit_thinking_block(&text);
+                        }
+                    }
+                    return vec![];
+                }
                 if self.saw_text_delta
                     || item.get("type").and_then(|t| t.as_str()) != Some("message")
                 {
@@ -488,7 +544,7 @@ impl ResponsesStreamState {
                             "index": self.block_index,
                             "content_block": {
                                 "type": "tool_use",
-                                "id": call_id,
+                                "id": tool_id::to_anthropic_tool_id(call_id),
                                 "name": original_name,
                                 "input": {},
                             },
@@ -606,6 +662,9 @@ impl ResponsesStreamState {
                     {
                         return vec![format_context_overflow_event()];
                     }
+                    if !self.buffered_text.is_empty() {
+                        return self.flush_buffered_text_or_tool();
+                    }
                     if !self.saw_text_delta && !self.block_started {
                         if let Some(output) = resp.get("output").and_then(|o| o.as_array()) {
                             for item in output {
@@ -618,6 +677,10 @@ impl ResponsesStreamState {
                             }
                         }
                     }
+                }
+                // Flush pending textual-tool candidates before terminal fallback/finalization.
+                if !self.buffered_text.is_empty() {
+                    return self.flush_buffered_text_or_tool();
                 }
                 // Don't emit anything here — finalization happens in the outer stream
                 vec![]
@@ -770,6 +833,73 @@ impl ResponsesStreamState {
         self.pending_event_type = None;
     }
 
+    fn flush_buffered_text_or_tool(&mut self) -> Vec<String> {
+        let text = std::mem::take(&mut self.buffered_text);
+        if let Some(parsed) = parse_textual_tool_call(&text) {
+            self.has_tool_use = true;
+            let events = vec![
+                format_sse(
+                    "content_block_start",
+                    &json!({
+                        "type":"content_block_start",
+                        "index": self.block_index,
+                        "content_block": {
+                            "type":"tool_use",
+                            "id": tool_id::to_anthropic_tool_id("call_text_1"),
+                            "name": parsed.name,
+                            "input": sanitize_tool_input(&parsed.name, parsed.input)
+                        }
+                    }),
+                ),
+                format_sse(
+                    "content_block_stop",
+                    &json!({"type":"content_block_stop","index": self.block_index}),
+                ),
+            ];
+            self.block_index += 1;
+            return events;
+        }
+        self.saw_text_delta = true;
+        self.block_started = true;
+        vec![
+            format_sse(
+                "content_block_start",
+                &json!({"type":"content_block_start","index": self.block_index,"content_block":{"type":"text","text":""}}),
+            ),
+            format_sse(
+                "content_block_delta",
+                &json!({"type":"content_block_delta","index": self.block_index,"delta":{"type":"text_delta","text": text}}),
+            ),
+        ]
+    }
+
+    fn emit_thinking_block(&mut self, text: &str) -> Vec<String> {
+        let events = vec![
+            format_sse(
+                "content_block_start",
+                &json!({
+                    "type": "content_block_start",
+                    "index": self.block_index,
+                    "content_block": {"type": "thinking", "thinking": ""},
+                }),
+            ),
+            format_sse(
+                "content_block_delta",
+                &json!({
+                    "type": "content_block_delta",
+                    "index": self.block_index,
+                    "delta": {"type": "thinking_delta", "thinking": text},
+                }),
+            ),
+            format_sse(
+                "content_block_stop",
+                &json!({"type":"content_block_stop","index": self.block_index}),
+            ),
+        ];
+        self.block_index += 1;
+        events
+    }
+
     fn emit_text_block(&mut self, text: &str) -> Vec<String> {
         let events = vec![
             format_sse(
@@ -807,6 +937,23 @@ fn output_item_types(items: &[Value]) -> Vec<String> {
         .collect()
 }
 
+fn extract_reasoning_summary(item: &Value) -> String {
+    item.get("summary")
+        .and_then(|v| v.as_array())
+        .map(|parts| {
+            parts
+                .iter()
+                .filter_map(|p| {
+                    p.get("text")
+                        .or_else(|| p.get("content"))
+                        .and_then(|v| v.as_str())
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .unwrap_or_default()
+}
+
 fn extract_message_text(item: &Value) -> String {
     item.get("content")
         .and_then(|c| c.as_array())
@@ -824,6 +971,21 @@ fn extract_message_text(item: &Value) -> String {
                 .join("\n")
         })
         .unwrap_or_default()
+}
+
+fn should_buffer_textual_tool_candidate(existing: &str, delta: &str) -> bool {
+    let candidate = format!("{existing}{delta}");
+    let text = candidate.trim_start();
+    if text.starts_with("<tool_use") {
+        return !text.contains("</tool_use>");
+    }
+    if text.starts_with("<function=") {
+        return !text.contains("</function>");
+    }
+    if text.starts_with("<tool_call>") {
+        return !text.contains("</tool_call>");
+    }
+    false
 }
 
 #[cfg(test)]
@@ -1097,6 +1259,53 @@ mod tests {
         assert!(!text.contains("overloaded_error"));
         assert!(!text.contains("Our servers are currently overloaded"));
         assert!(stream.next().await.is_none());
+    }
+
+    #[test]
+    fn test_reasoning_summary_visible_thinking() {
+        let mut state = ResponsesStreamState::new(ToolNameMap::new());
+        state.reasoning_bridge = ReasoningBridge::VisibleThinking;
+        let events = state.process_line(r#"data: {"type":"response.output_item.done","item":{"type":"reasoning","summary":[{"type":"summary_text","text":"think"}]}}"#);
+        let output = events.join("\n");
+        assert!(output.contains("thinking_delta"));
+        assert!(output.contains("think"));
+    }
+
+    #[test]
+    fn test_streamed_textual_tool_call_recovers_tool_use() {
+        let mut state = ResponsesStreamState::new(ToolNameMap::new());
+        assert!(state
+            .process_line(
+                r#"data: {"type":"response.output_text.delta","delta":"<function=Read>{\"file_path\":"}"#
+            )
+            .is_empty());
+        let events = state.process_line(r#"data: {"type":"response.output_text.done","text":"<function=Read>{\"file_path\":\"/tmp/a.md\"}</function>"}"#);
+        let rendered = events.join("\n");
+        assert!(rendered.contains("tool_use"));
+        assert!(rendered.contains("toolu_call_text_1"));
+        assert!(rendered.contains("/tmp/a.md"));
+    }
+
+    #[test]
+    fn test_function_like_text_streams_as_text() {
+        let mut state = ResponsesStreamState::new(ToolNameMap::new());
+        let events = state.process_line(
+            r#"data: {"type":"response.output_text.delta","delta":"Read({not a tool yet"}"#,
+        );
+        let rendered = events.join("\n");
+        assert!(rendered.contains("text_delta"));
+        assert!(rendered.contains("Read({not a tool yet"));
+    }
+
+    #[test]
+    fn test_output_text_done_without_delta_emits_text() {
+        let mut state = ResponsesStreamState::new(ToolNameMap::new());
+        let events = state.process_line(
+            r#"data: {"type":"response.output_text.done","text":"plain final text"}"#,
+        );
+        let rendered = events.join("\n");
+        assert!(rendered.contains("text_delta"));
+        assert!(rendered.contains("plain final text"));
     }
 
     #[test]

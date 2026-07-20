@@ -4,6 +4,9 @@ use anyhow::{bail, Result};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
+use crate::config::ReasoningBridge;
+use crate::proxy::translate::tool_id;
+use crate::proxy::translate::tool_text_parser::parse_textual_tool_call;
 use crate::proxy::util::{truncate_tool_name, ToolNameMap};
 
 const DEDUPE_FUNCTION_OUTPUT_MIN_BYTES: usize = 4096;
@@ -18,10 +21,27 @@ pub fn request_has_current_image(anthropic: &Value) -> bool {
         .is_some_and(content_has_image)
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ResponsesTranslationOptions {
+    pub reasoning_bridge: ReasoningBridge,
+}
+
 /// Convert Anthropic Messages API request → OpenAI Responses API request
 pub fn anthropic_to_responses(
     anthropic: &Value,
     default_model: &str,
+) -> Result<(Value, ToolNameMap)> {
+    anthropic_to_responses_with_options(
+        anthropic,
+        default_model,
+        ResponsesTranslationOptions::default(),
+    )
+}
+
+pub fn anthropic_to_responses_with_options(
+    anthropic: &Value,
+    default_model: &str,
+    options: ResponsesTranslationOptions,
 ) -> Result<(Value, ToolNameMap)> {
     let mut tool_name_map: ToolNameMap = HashMap::new();
     let mut input: Vec<Value> = Vec::new();
@@ -53,7 +73,7 @@ pub fn anthropic_to_responses(
                                     let images = extract_tool_result_images(block);
                                     input.push(json!({
                                         "type": "function_call_output",
-                                        "call_id": call_id,
+                                        "call_id": tool_id::to_upstream_tool_id(call_id),
                                         "output": output,
                                     }));
                                     if !images.is_empty() {
@@ -126,7 +146,7 @@ pub fn anthropic_to_responses(
 
                                 input.push(json!({
                                     "type": "function_call",
-                                    "call_id": id,
+                                    "call_id": tool_id::to_upstream_tool_id(id),
                                     "name": truncated,
                                     "arguments": arguments,
                                     "status": "completed",
@@ -198,10 +218,7 @@ pub fn anthropic_to_responses(
         body["instructions"] = json!(instructions);
     }
 
-    // Note: Anthropic `thinking` is intentionally NOT translated to OpenAI
-    // `reasoning` — the two APIs differ conceptually and bridging them causes
-    // rejections on models that don't support `reasoning.summary` (e.g.
-    // gpt-5.3-codex-spark). Thinking is silently dropped instead.
+    apply_reasoning_bridge(&mut body, anthropic, options.reasoning_bridge);
     apply_text_format(&mut body, anthropic)?;
     apply_prompt_cache_key(&mut body, anthropic);
 
@@ -255,6 +272,21 @@ pub fn anthropic_to_responses(
     }
 
     Ok((body, tool_name_map))
+}
+
+fn apply_reasoning_bridge(body: &mut Value, anthropic: &Value, mode: ReasoningBridge) {
+    if mode == ReasoningBridge::Off {
+        return;
+    }
+
+    let effort = anthropic
+        .pointer("/output_config/effort")
+        .and_then(|value| value.as_str())
+        .filter(|effort| matches!(*effort, "low" | "medium" | "high"));
+
+    if let Some(effort) = effort {
+        body["reasoning"] = json!({"effort": effort});
+    }
 }
 
 fn apply_text_format(body: &mut Value, anthropic: &Value) -> Result<()> {
@@ -377,7 +409,7 @@ pub fn responses_to_anthropic(resp: &Value, tool_name_map: &ToolNameMap) -> Resu
 
                     content.push(json!({
                         "type": "tool_use",
-                        "id": call_id,
+                        "id": tool_id::to_anthropic_tool_id(call_id),
                         "name": original_name,
                         "input": input,
                     }));
@@ -385,6 +417,9 @@ pub fn responses_to_anthropic(resp: &Value, tool_name_map: &ToolNameMap) -> Resu
                 _ => {}
             }
         }
+    }
+    if !has_tool_use {
+        has_tool_use = recover_textual_tool_call(&mut content);
     }
     if content.is_empty() {
         if let Some(text) = resp.get("output_text").and_then(|t| t.as_str()) {
@@ -395,6 +430,9 @@ pub fn responses_to_anthropic(resp: &Value, tool_name_map: &ToolNameMap) -> Resu
                 }));
             }
         }
+    }
+    if !has_tool_use {
+        has_tool_use = recover_textual_tool_call(&mut content);
     }
 
     // stop_reason
@@ -443,6 +481,26 @@ pub fn responses_to_anthropic(resp: &Value, tool_name_map: &ToolNameMap) -> Resu
     }))
 }
 
+fn recover_textual_tool_call(content: &mut [Value]) -> bool {
+    if content.len() != 1 {
+        return false;
+    }
+    let Some(text) = content[0].get("text").and_then(|value| value.as_str()) else {
+        return false;
+    };
+    let Some(parsed) = parse_textual_tool_call(text) else {
+        return false;
+    };
+    let input = sanitize_tool_input(&parsed.name, parsed.input);
+    content[0] = json!({
+        "type": "tool_use",
+        "id": tool_id::to_anthropic_tool_id("call_text_1"),
+        "name": parsed.name,
+        "input": input,
+    });
+    true
+}
+
 fn strip_context_window_suffix(model: &str) -> &str {
     model
         .strip_suffix("[1m]")
@@ -471,24 +529,30 @@ fn sanitize_read_pages(input: &mut Value) {
 
 fn convert_image_block(block: &Value) -> Option<Value> {
     let source = block.get("source")?;
-    if source.get("type").and_then(|t| t.as_str()) != Some("base64") {
-        return None;
+    match source.get("type").and_then(|t| t.as_str()) {
+        Some("file") => {
+            let file_id = source.get("file_id")?.as_str()?;
+            if file_id.is_empty() {
+                return None;
+            }
+            Some(json!({"type": "input_image", "file_id": file_id}))
+        }
+        Some("base64") => {
+            let data = source.get("data")?.as_str()?;
+            if data.is_empty() {
+                return None;
+            }
+            let media_type = source
+                .get("media_type")
+                .and_then(|m| m.as_str())
+                .unwrap_or("image/png");
+            Some(json!({
+                "type": "input_image",
+                "image_url": format!("data:{media_type};base64,{data}"),
+            }))
+        }
+        _ => None,
     }
-
-    let data = source.get("data")?.as_str()?;
-    if data.is_empty() {
-        return None;
-    }
-
-    let media_type = source
-        .get("media_type")
-        .and_then(|m| m.as_str())
-        .unwrap_or("image/png");
-
-    Some(json!({
-        "type": "input_image",
-        "image_url": format!("data:{media_type};base64,{data}"),
-    }))
 }
 
 fn convert_document_block(block: &Value) -> Result<Option<Value>> {
@@ -663,7 +727,7 @@ mod tests {
     fn function_output(call_id: &str, output: &str) -> Value {
         json!({
             "type": "function_call_output",
-            "call_id": call_id,
+            "call_id": tool_id::to_upstream_tool_id(call_id),
             "output": output,
         })
     }
@@ -944,9 +1008,46 @@ mod tests {
         let result = responses_to_anthropic(&resp, &HashMap::new()).unwrap();
         assert_eq!(result["stop_reason"], "tool_use");
         assert_eq!(result["content"][0]["type"], "tool_use");
-        assert_eq!(result["content"][0]["id"], "call_abc");
+        assert_eq!(result["content"][0]["id"], "toolu_call_abc");
         assert_eq!(result["content"][0]["name"], "get_weather");
         assert_eq!(result["content"][0]["input"]["location"], "Paris");
+    }
+
+    #[test]
+    fn test_responses_to_anthropic_textual_tool_call() {
+        let resp = json!({
+            "id": "resp_text_tool",
+            "model": "gpt-5.5",
+            "status": "completed",
+            "output": [{
+                "type": "message",
+                "content": [{"type": "output_text", "text": "Read({\"file_path\":\"/tmp/a.md\",\"pages\":\"\"})"}]
+            }],
+            "usage": {"input_tokens": 10, "output_tokens": 5}
+        });
+
+        let result = responses_to_anthropic(&resp, &HashMap::new()).unwrap();
+        assert_eq!(result["stop_reason"], "tool_use");
+        assert_eq!(result["content"][0]["type"], "tool_use");
+        assert_eq!(result["content"][0]["id"], "toolu_call_text_1");
+        assert_eq!(result["content"][0]["name"], "Read");
+        assert_eq!(result["content"][0]["input"]["file_path"], "/tmp/a.md");
+        assert!(result["content"][0]["input"].get("pages").is_none());
+    }
+
+    #[test]
+    fn test_responses_to_anthropic_prose_tool_like_text_remains_text() {
+        let resp = json!({
+            "id": "resp_text",
+            "model": "gpt-5.5",
+            "status": "completed",
+            "output_text": "I will call Read({\"file_path\":\"/tmp/a.md\"}) if needed.",
+            "usage": {"input_tokens": 10, "output_tokens": 5}
+        });
+
+        let result = responses_to_anthropic(&resp, &HashMap::new()).unwrap();
+        assert_eq!(result["stop_reason"], "end_turn");
+        assert_eq!(result["content"][0]["type"], "text");
     }
 
     #[test]
@@ -985,6 +1086,20 @@ mod tests {
         });
         let (body, _) = anthropic_to_responses(&anthropic, "gpt-4o").unwrap();
         assert_eq!(body["instructions"], "Part 1.\nPart 2.");
+    }
+
+    #[test]
+    fn test_image_file_block_maps_to_input_image_file() {
+        let anthropic = json!({
+            "model": "gpt-5.5",
+            "messages": [{"role":"user","content":[
+                {"type":"image","source":{"type":"file","file_id":"file_img"}}
+            ]}]
+        });
+        let (body, _) = anthropic_to_responses(&anthropic, "gpt-5.5").unwrap();
+        let content = body["input"][0]["content"].as_array().unwrap();
+        assert_eq!(content[0]["type"], "input_image");
+        assert_eq!(content[0]["file_id"], "file_img");
     }
 
     #[test]
@@ -1052,6 +1167,47 @@ mod tests {
         assert_eq!(body["text"]["format"]["type"], "json_schema");
         assert_eq!(body["text"]["format"]["name"], "result");
         assert_eq!(body["prompt_cache_key"], "claude-session-1");
+    }
+
+    #[test]
+    fn test_reasoning_bridge_effort_only_is_opt_in() {
+        let anthropic = json!({
+            "model": "gpt-5.5",
+            "messages": [{"role": "user", "content": "Think briefly"}],
+            "thinking": {"type": "enabled", "budget_tokens": 4096},
+            "output_config": {"effort": "high"}
+        });
+
+        let (body, _) = anthropic_to_responses_with_options(
+            &anthropic,
+            "gpt-5.5",
+            ResponsesTranslationOptions {
+                reasoning_bridge: ReasoningBridge::EffortOnly,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(body["reasoning"]["effort"], "high");
+        assert!(body["reasoning"].get("summary").is_none());
+    }
+
+    #[test]
+    fn test_reasoning_bridge_ignores_unknown_effort() {
+        let anthropic = json!({
+            "messages": [{"role": "user", "content": "hi"}],
+            "output_config": {"effort": "maximum"}
+        });
+
+        let (body, _) = anthropic_to_responses_with_options(
+            &anthropic,
+            "gpt-5.5",
+            ResponsesTranslationOptions {
+                reasoning_bridge: ReasoningBridge::EffortOnly,
+            },
+        )
+        .unwrap();
+
+        assert!(body.get("reasoning").is_none());
     }
 
     #[test]

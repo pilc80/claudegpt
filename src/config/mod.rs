@@ -130,6 +130,48 @@ pub struct ProfileConfig {
     /// 追加到请求 URL 的 query 参数（如 Azure OpenAI 的 api-version）
     #[serde(default)]
     pub query_params: HashMap<String, String>,
+    /// OpenAI Responses reasoning bridge mode. Disabled by default.
+    #[serde(default)]
+    pub reasoning_bridge: ReasoningBridge,
+    /// Optional OpenAI-compatible proxy-side context trimming. Disabled by default.
+    #[serde(default)]
+    pub openai_compatible_auto_compact: OpenAICompatibleAutoCompact,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ReasoningBridge {
+    #[default]
+    Off,
+    EffortOnly,
+    VisibleThinking,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OpenAICompatibleAutoCompact {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_auto_compact_max_items")]
+    pub max_items: usize,
+    #[serde(default = "default_auto_compact_reserve_tokens")]
+    pub reserve_tokens: u64,
+}
+
+impl Default for OpenAICompatibleAutoCompact {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_items: default_auto_compact_max_items(),
+            reserve_tokens: default_auto_compact_reserve_tokens(),
+        }
+    }
+}
+
+fn default_auto_compact_max_items() -> usize {
+    64
+}
+fn default_auto_compact_reserve_tokens() -> u64 {
+    4096
 }
 
 /// 参数剥离配置
@@ -173,22 +215,42 @@ impl From<StripParamsRaw> for StripParams {
 impl StripParams {
     /// 解析实际要剥离的参数列表，Auto 模式根据 base_url 推断
     pub fn resolve(&self, base_url: &str) -> Vec<String> {
+        self.resolve_for_model(base_url, "")
+    }
+
+    pub fn resolve_for_model(&self, base_url: &str, model: &str) -> Vec<String> {
         match self {
             StripParams::None => vec![],
             StripParams::List(list) => list.clone(),
-            StripParams::Auto => Self::infer_from_url(base_url),
+            StripParams::Auto => Self::infer_from_url_and_model(base_url, model),
         }
     }
 
     /// 已知端点的参数兼容性规则
-    fn infer_from_url(base_url: &str) -> Vec<String> {
-        if base_url.contains("chatgpt.com") {
+    fn infer_from_url_and_model(base_url: &str, model: &str) -> Vec<String> {
+        let normalized = base_url.to_ascii_lowercase();
+        let model = model.to_ascii_lowercase();
+        let reasoning_model = model.starts_with("o") || model.contains("reasoning");
+        if normalized.contains("chatgpt.com") {
             // Codex ChatGPT 端点不支持采样参数
-            vec![
+            let mut params = vec![
                 "temperature".to_string(),
                 "top_p".to_string(),
                 "top_k".to_string(),
-            ]
+                "stop".to_string(),
+            ];
+            if reasoning_model {
+                params.push("stop_sequences".to_string());
+            }
+            params
+        } else if normalized.contains("localhost")
+            || normalized.contains("127.0.0.1")
+            || normalized.contains("0.0.0.0")
+            || normalized.contains("vllm")
+            || normalized.contains("sglang")
+            || normalized.contains("trt")
+        {
+            vec!["top_k".to_string(), "stop_sequences".to_string()]
         } else {
             vec![]
         }
@@ -224,6 +286,8 @@ impl Default for ProfileConfig {
             max_tokens: None,
             strip_params: StripParams::default(),
             query_params: HashMap::new(),
+            reasoning_bridge: ReasoningBridge::default(),
+            openai_compatible_auto_compact: OpenAICompatibleAutoCompact::default(),
         }
     }
 }
@@ -599,6 +663,54 @@ impl Default for ClaudexConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn strip_params_auto_keeps_chatgpt_sampling_rules() {
+        assert_eq!(
+            StripParams::Auto.resolve("https://chatgpt.com/backend-api/codex"),
+            vec!["temperature", "top_p", "top_k", "stop"]
+        );
+    }
+
+    #[test]
+    fn strip_params_auto_uses_model_rules() {
+        assert_eq!(
+            StripParams::Auto.resolve_for_model("https://chatgpt.com/backend-api/codex", "o3"),
+            vec!["temperature", "top_p", "top_k", "stop", "stop_sequences"]
+        );
+    }
+
+    #[test]
+    fn reasoning_bridge_parses_visible_thinking() {
+        let config: ProfileConfig = toml::from_str(
+            r#"name = "local"
+base_url = "http://127.0.0.1:8000/v1"
+default_model = "m"
+reasoning_bridge = "visible_thinking"
+"#,
+        )
+        .unwrap();
+        assert_eq!(config.reasoning_bridge, ReasoningBridge::VisibleThinking);
+    }
+
+    #[test]
+    fn openai_compatible_auto_compact_defaults_off() {
+        let profile = ProfileConfig::default();
+        assert!(!profile.openai_compatible_auto_compact.enabled);
+        assert_eq!(profile.openai_compatible_auto_compact.max_items, 64);
+    }
+
+    #[test]
+    fn strip_params_auto_strips_local_openai_compat_extras() {
+        assert_eq!(
+            StripParams::Auto.resolve("http://127.0.0.1:8000/v1"),
+            vec!["top_k", "stop_sequences"]
+        );
+        assert_eq!(
+            StripParams::Auto.resolve("https://trt.example.test/v1"),
+            vec!["top_k", "stop_sequences"]
+        );
+    }
 
     fn make_profile(name: &str, enabled: bool) -> ProfileConfig {
         ProfileConfig {

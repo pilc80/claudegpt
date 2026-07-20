@@ -21,13 +21,28 @@ impl ProviderAdapter for ResponsesAdapter {
         body: &Value,
         profile: &ProfileConfig,
     ) -> Result<TranslatedRequest> {
+        let mut body = body.clone();
+        let warnings =
+            crate::proxy::translate::fixers::apply_openai_compatibility_fixers(&mut body);
+        for warning in warnings.iter() {
+            tracing::warn!(
+                profile = %profile.name,
+                code = warning.code,
+                message = %warning.message,
+                "applied OpenAI-compatible request fixer"
+            );
+        }
+        let options = crate::proxy::translate::responses::ResponsesTranslationOptions {
+            reasoning_bridge: profile.reasoning_bridge,
+        };
         let (mut responses_body, tool_name_map) =
-            crate::proxy::translate::responses::anthropic_to_responses(
-                body,
+            crate::proxy::translate::responses::anthropic_to_responses_with_options(
+                &body,
                 &profile.default_model,
+                options,
             )?;
         if let Some(image_model) = &profile.image_model {
-            if crate::proxy::translate::responses::request_has_current_image(body) {
+            if crate::proxy::translate::responses::request_has_current_image(&body) {
                 responses_body["model"] = serde_json::json!(image_model);
             }
         }
@@ -68,8 +83,17 @@ impl ProviderAdapter for ResponsesAdapter {
         crate::proxy::translate::responses::responses_to_anthropic(body, tool_name_map)
     }
 
-    fn translate_stream(&self, stream: ByteStream, tool_name_map: ToolNameMap) -> ByteStream {
-        crate::proxy::translate::responses_stream::translate_responses_stream(stream, tool_name_map)
+    fn translate_stream(
+        &self,
+        stream: ByteStream,
+        tool_name_map: ToolNameMap,
+        profile: &ProfileConfig,
+    ) -> ByteStream {
+        crate::proxy::translate::responses_stream::translate_responses_stream_with_reasoning(
+            stream,
+            tool_name_map,
+            profile.reasoning_bridge,
+        )
     }
 }
 
@@ -142,6 +166,33 @@ mod tests {
             translated.body["instructions"],
             CHATGPT_CODEX_DEFAULT_INSTRUCTIONS
         );
+    }
+
+    #[test]
+    fn test_reasoning_bridge_is_profile_gated() {
+        let body = json!({
+            "messages": [{"role": "user", "content": "hi"}],
+            "output_config": {"effort": "high"}
+        });
+        let off_profile = ProfileConfig {
+            default_model: "gpt-5.5".to_string(),
+            ..ProfileConfig::default()
+        };
+        let on_profile = ProfileConfig {
+            default_model: "gpt-5.5".to_string(),
+            reasoning_bridge: crate::config::ReasoningBridge::EffortOnly,
+            ..ProfileConfig::default()
+        };
+
+        let off = ResponsesAdapter
+            .translate_request(&body, &off_profile)
+            .unwrap();
+        let on = ResponsesAdapter
+            .translate_request(&body, &on_profile)
+            .unwrap();
+
+        assert!(off.body.get("reasoning").is_none());
+        assert_eq!(on.body["reasoning"]["effort"], "high");
     }
 
     #[test]

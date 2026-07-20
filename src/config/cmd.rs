@@ -435,6 +435,8 @@ mod tests {
             max_tokens: None,
             strip_params: Default::default(),
             query_params: Default::default(),
+            reasoning_bridge: Default::default(),
+            openai_compatible_auto_compact: Default::default(),
         }
     }
 

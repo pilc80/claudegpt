@@ -42,7 +42,12 @@ impl ProviderAdapter for DirectAnthropicAdapter {
         Ok(body.clone())
     }
 
-    fn translate_stream(&self, stream: ByteStream, _tool_name_map: ToolNameMap) -> ByteStream {
+    fn translate_stream(
+        &self,
+        stream: ByteStream,
+        _tool_name_map: ToolNameMap,
+        _profile: &ProfileConfig,
+    ) -> ByteStream {
         stream
     }
 }

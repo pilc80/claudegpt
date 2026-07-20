@@ -1,11 +1,15 @@
 use bytes::Bytes;
 use futures::stream::{Stream, StreamExt};
 use serde_json::{json, Value};
+use std::error::Error;
 use std::pin::Pin;
 
-use crate::config::ProviderType;
+use crate::config::{ProviderType, ReasoningBridge};
 use crate::proxy::error_translation;
+use crate::proxy::translate::{tool_id, tool_text_parser::parse_textual_tool_call};
 use crate::proxy::util::{format_sse, ToolNameMap};
+
+const UPSTREAM_STREAM_READ_TIMEOUT_SECS: u64 = 300;
 
 /// Translates an OpenAI SSE stream to Anthropic SSE format.
 ///
@@ -18,7 +22,19 @@ pub fn translate_sse_stream<S>(
 where
     S: Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static,
 {
+    translate_sse_stream_with_reasoning(input, tool_name_map, ReasoningBridge::Off)
+}
+
+pub fn translate_sse_stream_with_reasoning<S>(
+    input: S,
+    tool_name_map: ToolNameMap,
+    reasoning_bridge: ReasoningBridge,
+) -> Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send>>
+where
+    S: Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static,
+{
     let mut state = StreamState::new(tool_name_map);
+    state.reasoning_bridge = reasoning_bridge;
 
     let output = async_stream::stream! {
         let mut stream = std::pin::pin!(input);
@@ -77,9 +93,44 @@ where
                     }
                 }
                 Err(e) => {
-                    yield Ok(Bytes::from(error_translation::from_stream_transport(&e.to_string(), None).sse()));
+                    log_stream_read_error(&e, &state);
+                    if !state.buffered_text.is_empty() {
+                        for event in state.flush_buffered_text_or_tool() {
+                            if !message_started {
+                                yield Ok(Bytes::from(message_start_event()));
+                                message_started = true;
+                            }
+                            yield Ok(Bytes::from(event));
+                        }
+                    }
+                    if state.thinking_block_started {
+                        yield Ok(Bytes::from(format_sse("content_block_stop", &json!({
+                            "type": "content_block_stop",
+                            "index": state.block_index,
+                        }))));
+                        state.block_index += 1;
+                        state.thinking_block_started = false;
+                    }
+                    if state.block_started {
+                        yield Ok(Bytes::from(format_sse("content_block_stop", &json!({
+                            "type": "content_block_stop",
+                            "index": state.block_index,
+                        }))));
+                    }
+                    yield Ok(Bytes::from(format_stream_read_error_event(&e, &state)));
                     return;
                 }
+            }
+        }
+
+        if !state.buffered_text.is_empty() {
+            for event in state.flush_buffered_text_or_tool() {
+                if !message_started {
+                    yield Ok(Bytes::from(message_start_event()));
+                    message_started = true;
+                }
+                saw_translatable_event = true;
+                yield Ok(Bytes::from(event));
             }
         }
 
@@ -89,6 +140,15 @@ where
         }
 
         // Send final events
+        if state.thinking_block_started {
+            let block_stop = format_sse("content_block_stop", &json!({
+                "type": "content_block_stop",
+                "index": state.block_index,
+            }));
+            yield Ok(Bytes::from(block_stop));
+            state.block_index += 1;
+            state.thinking_block_started = false;
+        }
         if state.block_started {
             let block_stop = format_sse("content_block_stop", &json!({
                 "type": "content_block_stop",
@@ -129,6 +189,70 @@ fn message_start_event() -> String {
     )
 }
 
+fn format_stream_read_error_event(error: &reqwest::Error, state: &StreamState) -> String {
+    error_translation::from_stream_transport(&stream_read_error_message(error, state), None).sse()
+}
+
+fn stream_read_error_message(error: &reqwest::Error, state: &StreamState) -> String {
+    if error.is_timeout() {
+        return format!(
+            "upstream stream read error: claudex upstream stream read timed out after {UPSTREAM_STREAM_READ_TIMEOUT_SECS}s without receiving data; {}. This is usually an upstream stream that stopped producing data long enough to hit claudex's idle read timeout, not an auth, rate-limit, or upstream HTTP status failure",
+            stream_progress_message(state)
+        );
+    }
+
+    let root = source_chain(error)
+        .into_iter()
+        .last()
+        .unwrap_or_else(|| error.to_string());
+
+    if state.saw_upstream_data {
+        return format!(
+            "upstream stream read error: upstream connection closed before the stream completed; {}; root cause: {root}. This is usually a mid-stream transport interruption after a successful upstream response, not an auth, rate-limit, or upstream HTTP status failure",
+            stream_progress_message(state)
+        );
+    }
+
+    format!("upstream stream read error: {root}")
+}
+
+fn stream_progress_message(state: &StreamState) -> &'static str {
+    if state.saw_text_delta {
+        "upstream returned 200 OK and was still streaming text"
+    } else if state.saw_upstream_data {
+        "upstream returned 200 OK and started streaming"
+    } else {
+        "upstream returned 200 OK but no translatable stream content was received"
+    }
+}
+
+fn source_chain(error: &(dyn Error + 'static)) -> Vec<String> {
+    let mut chain = Vec::new();
+    let mut source = error.source();
+    while let Some(err) = source {
+        chain.push(err.to_string());
+        source = err.source();
+    }
+    chain
+}
+
+fn log_stream_read_error(error: &reqwest::Error, state: &StreamState) {
+    tracing::warn!(
+        error = %error,
+        error_debug = ?error,
+        is_decode = error.is_decode(),
+        is_timeout = error.is_timeout(),
+        is_body = error.is_body(),
+        is_connect = error.is_connect(),
+        source_chain = ?source_chain(error),
+        block_started = state.block_started,
+        current_tool_name = ?state.current_tool_call.as_ref().map(|tool| tool.name.as_str()),
+        saw_upstream_data = state.saw_upstream_data,
+        saw_text_delta = state.saw_text_delta,
+        "Chat Completions stream read error"
+    );
+}
+
 fn sanitize_tool_input(tool_name: &str, mut input: Value) -> Value {
     if tool_name == "Read" {
         sanitize_read_pages(&mut input);
@@ -154,6 +278,11 @@ struct StreamState {
     output_tokens: u64,
     current_tool_call: Option<ToolCallState>,
     tool_name_map: ToolNameMap,
+    saw_upstream_data: bool,
+    saw_text_delta: bool,
+    reasoning_bridge: ReasoningBridge,
+    thinking_block_started: bool,
+    buffered_text: String,
 }
 
 struct ToolCallState {
@@ -170,6 +299,11 @@ impl StreamState {
             output_tokens: 0,
             current_tool_call: None,
             tool_name_map,
+            saw_upstream_data: false,
+            saw_text_delta: false,
+            reasoning_bridge: ReasoningBridge::Off,
+            thinking_block_started: false,
+            buffered_text: String::new(),
         }
     }
 
@@ -177,10 +311,14 @@ impl StreamState {
         let data = line.strip_prefix("data: ")?.trim();
 
         if data == "[DONE]" {
+            if !self.buffered_text.is_empty() {
+                return Some(self.flush_buffered_text_or_tool());
+            }
             return self.finalize_tool_call();
         }
 
         let parsed: Value = serde_json::from_str(data).ok()?;
+        self.saw_upstream_data = true;
         if parsed.get("error").is_some() {
             let err =
                 error_translation::from_http_status(axum::http::StatusCode::BAD_GATEWAY, data);
@@ -198,6 +336,45 @@ impl StreamState {
             }
         }
 
+        if self.reasoning_bridge == ReasoningBridge::VisibleThinking {
+            if let Some(reasoning) = delta
+                .get("reasoning_content")
+                .or_else(|| delta.get("reasoning"))
+                .or_else(|| delta.get("thinking"))
+                .and_then(|c| c.as_str())
+            {
+                if !reasoning.is_empty() {
+                    if self.block_started {
+                        events.push(format_sse(
+                            "content_block_stop",
+                            &json!({"type":"content_block_stop","index": self.block_index}),
+                        ));
+                        self.block_index += 1;
+                        self.block_started = false;
+                    }
+                    if !self.thinking_block_started {
+                        events.push(format_sse(
+                            "content_block_start",
+                            &json!({
+                                "type": "content_block_start",
+                                "index": self.block_index,
+                                "content_block": {"type": "thinking", "thinking": ""}
+                            }),
+                        ));
+                        self.thinking_block_started = true;
+                    }
+                    events.push(format_sse(
+                        "content_block_delta",
+                        &json!({
+                            "type": "content_block_delta",
+                            "index": self.block_index,
+                            "delta": {"type": "thinking_delta", "thinking": reasoning}
+                        }),
+                    ));
+                }
+            }
+        }
+
         // Handle text content
         if let Some(content) = delta.get("content").and_then(|c| c.as_str()) {
             if !content.is_empty() {
@@ -206,28 +383,47 @@ impl StreamState {
                     events.extend(tool_events);
                 }
 
-                if !self.block_started || self.current_tool_call.is_some() {
-                    let block_start = format_sse(
-                        "content_block_start",
+                if !self.block_started
+                    && self.current_tool_call.is_none()
+                    && should_buffer_textual_tool_candidate(&self.buffered_text, content)
+                {
+                    self.buffered_text.push_str(content);
+                } else if !self.buffered_text.is_empty() {
+                    self.buffered_text.push_str(content);
+                    events.extend(self.flush_buffered_text_or_tool());
+                } else {
+                    self.saw_text_delta = true;
+                    if self.thinking_block_started {
+                        events.push(format_sse(
+                            "content_block_stop",
+                            &json!({"type":"content_block_stop","index": self.block_index}),
+                        ));
+                        self.block_index += 1;
+                        self.thinking_block_started = false;
+                    }
+                    if !self.block_started || self.current_tool_call.is_some() {
+                        let block_start = format_sse(
+                            "content_block_start",
+                            &json!({
+                                "type": "content_block_start",
+                                "index": self.block_index,
+                                "content_block": {"type": "text", "text": ""}
+                            }),
+                        );
+                        events.push(block_start);
+                        self.block_started = true;
+                    }
+
+                    let block_delta = format_sse(
+                        "content_block_delta",
                         &json!({
-                            "type": "content_block_start",
+                            "type": "content_block_delta",
                             "index": self.block_index,
-                            "content_block": {"type": "text", "text": ""}
+                            "delta": {"type": "text_delta", "text": content}
                         }),
                     );
-                    events.push(block_start);
-                    self.block_started = true;
+                    events.push(block_delta);
                 }
-
-                let block_delta = format_sse(
-                    "content_block_delta",
-                    &json!({
-                        "type": "content_block_delta",
-                        "index": self.block_index,
-                        "delta": {"type": "text_delta", "text": content}
-                    }),
-                );
-                events.push(block_delta);
             }
         }
 
@@ -240,6 +436,14 @@ impl StreamState {
                 // New tool call starts
                 if let Some(id) = tc.get("id").and_then(|id| id.as_str()) {
                     // Finalize previous blocks
+                    if self.thinking_block_started {
+                        events.push(format_sse(
+                            "content_block_stop",
+                            &json!({"type":"content_block_stop","index": self.block_index}),
+                        ));
+                        self.block_index += 1;
+                        self.thinking_block_started = false;
+                    }
                     if self.block_started {
                         events.push(format_sse(
                             "content_block_stop",
@@ -276,7 +480,7 @@ impl StreamState {
                             "index": self.block_index,
                             "content_block": {
                                 "type": "tool_use",
-                                "id": id,
+                                "id": tool_id::to_anthropic_tool_id(id),
                                 "name": name,
                                 "input": {}
                             }
@@ -313,6 +517,8 @@ impl StreamState {
                 if let Some(tool_events) = self.finalize_tool_call() {
                     events.extend(tool_events);
                 }
+            } else if !self.buffered_text.is_empty() {
+                events.extend(self.flush_buffered_text_or_tool());
             }
         }
 
@@ -321,6 +527,51 @@ impl StreamState {
         } else {
             Some(events)
         }
+    }
+
+    fn flush_buffered_text_or_tool(&mut self) -> Vec<String> {
+        let text = std::mem::take(&mut self.buffered_text);
+        if let Some(parsed) = parse_textual_tool_call(&text) {
+            self.has_textual_tool_use();
+            let events = vec![
+                format_sse(
+                    "content_block_start",
+                    &json!({
+                        "type":"content_block_start",
+                        "index": self.block_index,
+                        "content_block": {
+                            "type":"tool_use",
+                            "id": tool_id::to_anthropic_tool_id("call_text_1"),
+                            "name": parsed.name,
+                            "input": sanitize_tool_input(&parsed.name, parsed.input)
+                        }
+                    }),
+                ),
+                format_sse(
+                    "content_block_stop",
+                    &json!({"type":"content_block_stop","index": self.block_index}),
+                ),
+            ];
+            self.block_index += 1;
+            return events;
+        }
+        self.saw_text_delta = true;
+        self.block_started = true;
+        vec![
+            format_sse(
+                "content_block_start",
+                &json!({"type":"content_block_start","index": self.block_index,"content_block":{"type":"text","text":""}}),
+            ),
+            format_sse(
+                "content_block_delta",
+                &json!({"type":"content_block_delta","index": self.block_index,"delta":{"type":"text_delta","text": text}}),
+            ),
+        ]
+    }
+
+    fn has_textual_tool_use(&mut self) {
+        self.saw_text_delta = true;
+        self.block_started = false;
     }
 
     fn finalize_tool_call(&mut self) -> Option<Vec<String>> {
@@ -361,6 +612,21 @@ impl StreamState {
 
         Some(events)
     }
+}
+
+fn should_buffer_textual_tool_candidate(existing: &str, delta: &str) -> bool {
+    let candidate = format!("{existing}{delta}");
+    let text = candidate.trim_start();
+    if text.starts_with("<tool_use") {
+        return !text.contains("</tool_use>");
+    }
+    if text.starts_with("<function=") {
+        return !text.contains("</function>");
+    }
+    if text.starts_with("<tool_call>") {
+        return !text.contains("</tool_call>");
+    }
+    false
 }
 
 #[cfg(test)]
@@ -646,6 +912,93 @@ mod tests {
         assert!(rendered.contains("/tmp/a.pdf"));
         assert!(rendered.contains("pages"));
         assert!(rendered.contains("1-2"));
+    }
+
+    #[tokio::test]
+    async fn test_stream_timeout_error_explains_claudex_upstream_timeout() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let _accepted = listener.accept().await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        });
+
+        let error = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_millis(10))
+            .build()
+            .unwrap()
+            .get(format!("http://{addr}/"))
+            .send()
+            .await
+            .unwrap_err();
+        assert!(error.is_timeout());
+        server.abort();
+
+        let input = futures::stream::iter(vec![
+            Ok(Bytes::from(
+                "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n",
+            )),
+            Err(error),
+        ]);
+        let mut stream = translate_sse_stream(input, ToolNameMap::new());
+
+        let mut output = String::new();
+        while let Some(chunk) = stream.next().await {
+            output.push_str(std::str::from_utf8(&chunk.unwrap()).unwrap());
+        }
+
+        assert!(output.contains("event: error"));
+        assert!(output.contains("claudex upstream stream read timed out after 300s"));
+        assert!(output.contains("upstream returned 200 OK and was still streaming text"));
+        assert!(output.contains("idle read timeout"));
+    }
+
+    #[test]
+    fn test_reasoning_content_visible_thinking() {
+        let mut state = StreamState::new(std::collections::HashMap::new());
+        state.reasoning_bridge = ReasoningBridge::VisibleThinking;
+        let line = format!(
+            "data: {}",
+            json!({"choices":[{"delta":{"reasoning_content":"think"}}]})
+        );
+        let events = state.process_openai_line(&line).unwrap();
+        assert!(events.join("\n").contains("thinking_delta"));
+        assert!(events.join("\n").contains("think"));
+    }
+
+    #[test]
+    fn test_streamed_textual_tool_call_recovers_tool_use() {
+        let mut state = StreamState::new(std::collections::HashMap::new());
+        state
+            .process_openai_line(&format!(
+                "data: {}",
+                json!({"choices":[{"delta":{"content":"<function=Read>{\"file_path\":"}}]})
+            ))
+            .unwrap_or_default();
+        let events = state
+            .process_openai_line(&format!(
+                "data: {}",
+                json!({"choices":[{"delta":{"content":"\"/tmp/a.md\"}</function>"},"finish_reason":"stop"}]})
+            ))
+            .unwrap();
+        let rendered = events.join("\n");
+        assert!(rendered.contains("tool_use"));
+        assert!(rendered.contains("toolu_call_text_1"));
+        assert!(rendered.contains("/tmp/a.md"));
+    }
+
+    #[test]
+    fn test_function_like_text_streams_as_text() {
+        let mut state = StreamState::new(std::collections::HashMap::new());
+        let events = state
+            .process_openai_line(&format!(
+                "data: {}",
+                json!({"choices":[{"delta":{"content":"Read({not a tool yet"}}]})
+            ))
+            .unwrap();
+        let rendered = events.join("\n");
+        assert!(rendered.contains("text_delta"));
+        assert!(rendered.contains("Read({not a tool yet"));
     }
 
     #[test]

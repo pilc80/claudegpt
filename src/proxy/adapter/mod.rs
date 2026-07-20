@@ -29,14 +29,20 @@ pub trait ProviderAdapter: Send + Sync {
 
     /// 根据 profile 的 strip_params 配置过滤翻译后的请求体
     fn filter_translated_body(&self, body: &mut Value, profile: &ProfileConfig) {
-        let params_to_strip = profile.strip_params.resolve(&profile.base_url);
+        let model = body
+            .get("model")
+            .and_then(|value| value.as_str())
+            .unwrap_or(&profile.default_model);
+        let params_to_strip = profile
+            .strip_params
+            .resolve_for_model(&profile.base_url, model);
         if let Some(obj) = body.as_object_mut() {
             for param in &params_to_strip {
                 if obj.remove(param).is_some() {
-                    tracing::debug!(
-                        "stripped unsupported param '{}' for {}",
-                        param,
-                        profile.name
+                    tracing::warn!(
+                        profile = %profile.name,
+                        parameter = %param,
+                        "stripped unsupported upstream request parameter"
                     );
                 }
             }
@@ -64,7 +70,12 @@ pub trait ProviderAdapter: Send + Sync {
     fn translate_response(&self, body: &Value, tool_name_map: &ToolNameMap) -> Result<Value>;
 
     /// 翻译流式响应
-    fn translate_stream(&self, stream: ByteStream, tool_name_map: ToolNameMap) -> ByteStream;
+    fn translate_stream(
+        &self,
+        stream: ByteStream,
+        tool_name_map: ToolNameMap,
+        profile: &ProfileConfig,
+    ) -> ByteStream;
 }
 
 /// 根据 ProviderType 创建对应的 Adapter
