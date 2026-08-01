@@ -1,6 +1,6 @@
 [package]
 name = "claudex"
-version = "0.9.61"
+version = "0.9.63"
 edition = "2021"
 autobins = false
 description = "ChatGPT/Codex OAuth for Claude Code without an API key"

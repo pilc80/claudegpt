@@ -171,7 +171,7 @@ fn default_auto_compact_max_items() -> usize {
     64
 }
 fn default_auto_compact_reserve_tokens() -> u64 {
-    4096
+    64_000
 }
 
 /// 参数剥离配置
@@ -611,7 +611,15 @@ enabled = false
                 toml::to_string_pretty(self).context("failed to serialize config to TOML")?
             }
         };
-        std::fs::write(&path, content)?;
+
+        // Atomic write: write to temp file in the same directory, then rename.
+        // This prevents a partially-written config if the process is killed mid-write.
+        let parent = path
+            .parent()
+            .context("config path has no parent directory")?;
+        let tmp_path = parent.join(format!(".claudex-tmp-{}", std::process::id()));
+        std::fs::write(&tmp_path, &content)?;
+        std::fs::rename(&tmp_path, &path)?;
         Ok(())
     }
 

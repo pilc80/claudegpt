@@ -5,7 +5,7 @@ use anyhow::{Context, Result};
 use crate::cli::ConfigAction;
 use crate::oauth::{AuthType, OAuthProvider, OAuthToken};
 
-use super::ClaudexConfig;
+use super::{ClaudexConfig, ProfileConfig};
 
 pub async fn dispatch(action: ConfigAction, config: &mut ClaudexConfig) -> Result<()> {
     match action {
@@ -16,7 +16,187 @@ pub async fn dispatch(action: ConfigAction, config: &mut ClaudexConfig) -> Resul
             profile,
             connectivity,
         } => cmd_doctor(config, json, fix, &profile, connectivity).await,
+        ConfigAction::Migrate { yes } => cmd_migrate(config, yes).await,
     }
+}
+
+/// On-request, non-silenced migration to the canonical config format.
+///
+/// Backs up the active config file, reports any keys present in the file that are
+/// not part of the current schema (legacy/renamed fields that would otherwise be
+/// silently dropped), then rewrites the file in the canonical format.
+async fn cmd_migrate(config: &mut ClaudexConfig, yes: bool) -> Result<()> {
+    let path = match config.config_source.clone() {
+        Some(path) => path,
+        None => {
+            println!("No config file found; nothing to migrate.");
+            return Ok(());
+        }
+    };
+
+    let raw = std::fs::read_to_string(&path)
+        .with_context(|| format!("failed to read config: {}", path.display()))?;
+    let unknown = detect_unknown_config_keys(&raw, &path)?;
+
+    // Credentials/keys must NEVER be dropped. If any unknown key looks like a
+    // secret, refuse to migrate rather than risk losing it on the canonical rewrite.
+    let credentials: Vec<&String> = unknown
+        .iter()
+        .filter(|key| looks_like_credential(key))
+        .collect();
+    if !credentials.is_empty() {
+        println!("WARNING: credential/secret-like keys are present but not in the current schema:");
+        for key in &credentials {
+            println!("  - {key}");
+        }
+        println!(
+            "Refusing to migrate: all credentials must be kept. Port these to the current\n\
+             schema (or confirm they are obsolete), then re-run `config migrate`."
+        );
+        anyhow::bail!("migration aborted to preserve credential-like keys");
+    }
+
+    if unknown.is_empty() {
+        println!("No unknown/deprecated keys found; config is already canonical.");
+    } else {
+        println!("Unknown/deprecated keys that will be dropped on rewrite:");
+        for key in &unknown {
+            println!("  - {key}");
+        }
+        tracing::warn!(
+            count = unknown.len(),
+            keys = ?unknown,
+            "config migration detected unknown/deprecated keys"
+        );
+    }
+
+    if !yes
+        && !prompt_yes_no(
+            "Rewrite this config in the canonical format (a backup will be created)?",
+            false,
+        )?
+    {
+        println!("Aborted; config unchanged.");
+        return Ok(());
+    }
+
+    let backup = backup_config_path(&path);
+    std::fs::copy(&path, &backup)
+        .with_context(|| format!("failed to back up config to {}", backup.display()))?;
+    println!("Backed up to {}", backup.display());
+
+    // Re-load from the file only (without CLAUDEX_* env overrides merged in by
+    // discover_config) so transient environment values are not baked into the file.
+    let canonical = ClaudexConfig::load_from(&path)?;
+    canonical.save()?;
+    println!(
+        "Migrated {} to canonical format ({} profile(s) kept, {} unknown key(s) dropped).",
+        path.display(),
+        canonical.profiles.len(),
+        unknown.len()
+    );
+    Ok(())
+}
+
+/// Backup name: `<file>.bak-YYYYMMDD-HHMMSS-{pid}` (never retimestamped).
+/// PID suffix avoids collisions when multiple migrate runs happen in the same second.
+fn backup_config_path(path: &std::path::Path) -> std::path::PathBuf {
+    let ts = chrono::Local::now().format("%Y%m%d-%H%M%S");
+    let stem = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "config.toml".to_string());
+    path.with_file_name(format!("{stem}.bak-{ts}-{}", std::process::id()))
+}
+
+/// Compare the raw config file against the current schema, returning dotted paths
+/// of keys present in the file but absent from `ClaudexConfig` (the "oldfugs").
+fn detect_unknown_config_keys(raw: &str, path: &std::path::Path) -> Result<Vec<String>> {
+    let ext = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(str::to_ascii_lowercase)
+        .unwrap_or_else(|| "toml".to_string());
+
+    let have: serde_json::Value = match ext.as_str() {
+        "yaml" | "yml" => serde_yml::from_str(raw).context("failed to parse YAML config")?,
+        _ => toml::from_str(raw).context("failed to parse TOML config")?,
+    };
+
+    // Canonical schema; inject a sample profile so [[profiles]] element shape is known.
+    let mut known = serde_json::to_value(ClaudexConfig::default())
+        .context("failed to serialize canonical config")?;
+    if let Some(profiles) = known
+        .get_mut("profiles")
+        .and_then(|value| value.as_array_mut())
+    {
+        profiles.push(
+            serde_json::to_value(ProfileConfig::default())
+                .context("failed to serialize canonical profile")?,
+        );
+    }
+
+    let mut unknown = Vec::new();
+    diff_unknown_keys(&have, &known, "", &mut unknown);
+    unknown.sort();
+    Ok(unknown)
+}
+
+fn diff_unknown_keys(
+    have: &serde_json::Value,
+    known: &serde_json::Value,
+    prefix: &str,
+    out: &mut Vec<String>,
+) {
+    match (have, known) {
+        // An empty `known` object marks a map/dictionary field (HashMap) whose keys
+        // are user data, not schema fields — never flag its entries as unknown.
+        (serde_json::Value::Object(have_map), serde_json::Value::Object(known_map))
+            if !known_map.is_empty() =>
+        {
+            for (key, value) in have_map {
+                let path = if prefix.is_empty() {
+                    key.clone()
+                } else {
+                    format!("{prefix}.{key}")
+                };
+                match known_map.get(key) {
+                    Some(known_value) => diff_unknown_keys(value, known_value, &path, out),
+                    None => out.push(path),
+                }
+            }
+        }
+        (serde_json::Value::Array(have_arr), serde_json::Value::Array(known_arr)) => {
+            if let Some(known_element) = known_arr.first() {
+                for (index, element) in have_arr.iter().enumerate() {
+                    diff_unknown_keys(element, known_element, &format!("{prefix}[{index}]"), out);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Heuristic: does this config key look like a credential/secret?
+/// Conservative on purpose — a false positive makes migration refuse (safe side).
+fn looks_like_credential(key: &str) -> bool {
+    let leaf = key.rsplit('.').next().unwrap_or(key).to_ascii_lowercase();
+    const MARKERS: &[&str] = &[
+        "secret",
+        "token",
+        "password",
+        "passwd",
+        "credential",
+        "apikey",
+        "api_key",
+        "access_key",
+        "cookie",
+        "authorization",
+        "bearer",
+        "jwt",
+        "session",
+    ];
+    MARKERS.iter().any(|marker| leaf.contains(marker)) || leaf == "key" || leaf.ends_with("_key")
 }
 
 fn cmd_show(config: &ClaudexConfig) -> Result<()> {
@@ -212,6 +392,25 @@ async fn build_doctor_report(config: &ClaudexConfig, connectivity: bool) -> Doct
             "context.rag.profile '{}' does not match any profile",
             config.context.rag.profile
         ));
+    }
+
+    // Warn if any profile has openai_compatible_auto_compact enabled and
+    // reserve_tokens is still at the old low default (4096).
+    for p in &config.profiles {
+        if p.openai_compatible_auto_compact.enabled
+            && p.openai_compatible_auto_compact.reserve_tokens == 4096
+        {
+            warnings.push(format!(
+                "profile '{}': openai_compatible_auto_compact is enabled with reserve_tokens=4096 (default). \
+                 Consider raising it (e.g. to 64000) for large-window models.",
+                p.name
+            ));
+        }
+        if p.openai_compatible_auto_compact.enabled {
+            // Note: claudex also forces CLAUDE_CODE_AUTO_COMPACT_WINDOW=262k on launch.
+            // If reserve_tokens is set low, the proxy-side compaction may fire before
+            // Claude Code's client-side compaction, producing unexpected truncation.
+        }
     }
 
     if which::which(&config.claude_binary).is_err() {
@@ -496,5 +695,123 @@ mod tests {
             .errors
             .iter()
             .any(|e| e.contains("duplicate profile")));
+    }
+
+    #[test]
+    fn detect_unknown_config_keys_flags_legacy_fields() {
+        let path =
+            std::env::temp_dir().join(format!("claudex-migrate-{}-flags.toml", std::process::id()));
+        std::fs::write(
+            &path,
+            r#"
+legacy_global = "dropped"
+
+[[profiles]]
+name = "test"
+default_model = "gpt-5.5"
+base_url = "https://example.com"
+provider_type = "OpenAIResponses"
+removed_field = "oldfug"
+"#,
+        )
+        .unwrap();
+
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let unknown = detect_unknown_config_keys(&raw, &path).unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        assert!(unknown.iter().any(|k| k == "legacy_global"));
+        assert!(unknown.iter().any(|k| k == "profiles[0].removed_field"));
+    }
+
+    #[test]
+    fn credential_heuristic_matches_secret_names() {
+        assert!(looks_like_credential("profiles[0].legacy_api_key"));
+        assert!(looks_like_credential("refresh_token"));
+        assert!(looks_like_credential("client_secret"));
+        assert!(looks_like_credential("password"));
+        assert!(!looks_like_credential("default_model"));
+        assert!(!looks_like_credential("base_url"));
+    }
+
+    #[test]
+    fn detect_flags_credential_like_unknown_keys() {
+        let path =
+            std::env::temp_dir().join(format!("claudex-migrate-{}-cred.toml", std::process::id()));
+        std::fs::write(
+            &path,
+            r#"
+[[profiles]]
+name = "test"
+default_model = "gpt-5.5"
+base_url = "https://example.com"
+provider_type = "OpenAIResponses"
+legacy_api_key = "sk-secret"
+legacy_refresh_token = "tok"
+"#,
+        )
+        .unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let unknown = detect_unknown_config_keys(&raw, &path).unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        let cred_like: Vec<&String> = unknown
+            .iter()
+            .filter(|k| looks_like_credential(k))
+            .collect();
+        assert!(cred_like.iter().any(|k| k.contains("legacy_api_key")));
+        assert!(cred_like.iter().any(|k| k.contains("legacy_refresh_token")));
+    }
+
+    #[test]
+    fn detect_does_not_flag_map_entries_as_unknown() {
+        let path =
+            std::env::temp_dir().join(format!("claudex-migrate-{}-maps.toml", std::process::id()));
+        std::fs::write(
+            &path,
+            r#"
+[[profiles]]
+name = "test"
+default_model = "gpt-5.5"
+base_url = "https://example.com"
+provider_type = "OpenAIResponses"
+
+[profiles.custom_headers]
+X-Custom = "value"
+
+[profiles.extra_env]
+OPENAI_API_KEY = "sk-x"
+FOO = "bar"
+
+[profiles.query_params]
+api-version = "2026-01-01"
+"#,
+        )
+        .unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let unknown = detect_unknown_config_keys(&raw, &path).unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        // HashMap entries are user data, not schema keys — must never be flagged.
+        assert!(
+            unknown.is_empty(),
+            "legitimate map entries flagged as unknown: {unknown:?}"
+        );
+    }
+
+    #[test]
+    fn detect_unknown_config_keys_clean_for_canonical_config() {
+        let canonical = toml::to_string(&ClaudexConfig::default()).unwrap();
+        let path =
+            std::env::temp_dir().join(format!("claudex-migrate-{}-clean.toml", std::process::id()));
+        std::fs::write(&path, &canonical).unwrap();
+
+        let unknown = detect_unknown_config_keys(&canonical, &path).unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        assert!(
+            unknown.is_empty(),
+            "canonical config flagged unknown keys: {unknown:?}"
+        );
     }
 }

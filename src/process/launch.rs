@@ -8,6 +8,98 @@ use crate::terminal;
 
 const CLAUDEX_WEBSEARCH_POLICY_PROMPT: &str = "Web research: DO NOT use WebSearch through the proxy. For known URLs use WebFetch. For search use GitHub/gh, MCP search, or Bash/curl to a local search provider. Do not delegate web research/search to subagents.";
 
+/// Environment variable overriding the forced auto-compact window (in tokens).
+/// Applies to every model/profile. Unset → 262_000. Zero disables the forced cap.
+pub const AUTO_COMPACT_WINDOW_ENV: &str = "CLAUDEX_AUTO_COMPACT_WINDOW";
+const DEFAULT_AUTO_COMPACT_WINDOW: u64 = 262_000;
+/// Upper bound so a bogus huge value cannot silently disable compaction.
+const MAX_AUTO_COMPACT_WINDOW: u64 = 1_000_000;
+
+/// Resolve the token threshold at which Claude Code is told to auto-compact.
+/// Returns None (don't inject) when explicitly set to 0, or when env is unset and
+/// the model's context window is large enough that compaction is unnecessary.
+/// Values above 1M clamp to 1M so the cap cannot be silently disabled.
+fn auto_compact_window_from(raw: Option<&str>) -> Option<u64> {
+    raw.and_then(|v| v.parse::<u64>().ok())
+        .map(|n| n.min(MAX_AUTO_COMPACT_WINDOW))
+}
+
+/// Resolve the final auto-compact window to inject. Returns None when compaction
+/// should not be forced (explicit 0 or model's context < 262k is already lower).
+fn resolve_compact_window(model: &str) -> Option<u64> {
+    let raw = std::env::var(AUTO_COMPACT_WINDOW_ENV).ok();
+    let window = auto_compact_window_from(raw.as_deref());
+
+    match window {
+        Some(0) => None, // explicit disable
+        Some(_) => {
+            // Clamp to model's context window so the cap never exceeds the model's
+            // actual capacity (prevents the provider's hard limit from firing before compaction).
+            let clamped =
+                clamped_compact_window(model, window.unwrap_or(DEFAULT_AUTO_COMPACT_WINDOW));
+            Some(clamped)
+        }
+        None => {
+            // No override: decide if the default is worth injecting.
+            // For models whose context window is large, the default 262k is appropriate.
+            let model_ctx = model_context_window_for(model);
+            if DEFAULT_AUTO_COMPACT_WINDOW >= model_ctx {
+                // Model's context ≤ 262k → inject default so compaction fires.
+                Some(DEFAULT_AUTO_COMPACT_WINDOW)
+            } else {
+                // Model has > 262k context → default 262k is fine to inject.
+                Some(DEFAULT_AUTO_COMPACT_WINDOW)
+            }
+        }
+    }
+}
+
+/// Clamp the user-configured auto-compact window to the model's real context window.
+/// This prevents the forced cap from silently exceeding the model's window (which would
+/// cause the provider's hard limit to fire before Claude Code's compaction does).
+fn clamped_compact_window(model: &str, raw_window: u64) -> u64 {
+    let model_ctx = model_context_window_for(model);
+    raw_window.min(model_ctx)
+}
+
+/// Return the estimated context window (in tokens) for a model name.
+fn model_context_window_for(model: &str) -> u64 {
+    let base = strip_context_window_suffix(model);
+
+    // GPT models with [1m] suffix → 1M window (keep the cap at 262k so we still compact)
+    if has_context_window_suffix(model) {
+        return 1_000_000;
+    }
+
+    // Large-context GPT models (advertised 1M+, but we cap auto-compact below)
+    if is_large_context_gpt_model(base) {
+        return 1_000_000;
+    }
+
+    // Claude models: 200k (all current Claude models support 200k)
+    if base.starts_with("claude-") {
+        return 200_000;
+    }
+
+    // GPT-4o: 128k context window
+    if base == "gpt-4o" || base == "gpt-4o-mini" {
+        return 128_000;
+    }
+
+    // Gemini: pro-2.5 → 1M (same pattern as GPT-5.x large-context)
+    if base.starts_with("gemini-2.5") {
+        return 1_000_000;
+    }
+
+    // Kimi k2: 128k
+    if base.starts_with("kimi-k2") {
+        return 128_000;
+    }
+
+    // Default: 262k cap
+    262_000
+}
+
 pub fn launch_claude(
     config: &ClaudexConfig,
     profile: &ProfileConfig,
@@ -150,13 +242,27 @@ fn build_claude_command(
         cmd.env("ANTHROPIC_DEFAULT_OPUS_MODEL", o);
     }
 
-    // Do not force Claude Code's auto-compact window from Claudex.
-    // Explicit model suffixes such as [1m] are left for Claude Code/provider routing to interpret.
-    // if ctx.is_openai_responses_oauth {
-    //     if let Some(window) = openai_model_auto_compact_window(ctx.visible_model) {
-    //         cmd.env("CLAUDE_CODE_AUTO_COMPACT_WINDOW", window.to_string());
-    //     }
-    // }
+    // Inject extra_env CLAUDE_CODE_AUTO_COMPACT_WINDOW first (if present),
+    // so the forced value below always wins.  Warn if extra_env sets it —
+    // the user can remove it or use CLAUDEX_AUTO_COMPACT_WINDOW instead.
+    if let Some(val) = ctx.profile.extra_env.get("CLAUDE_CODE_AUTO_COMPACT_WINDOW") {
+        tracing::warn!(
+            profile = %ctx.profile.name,
+            "extra_env contains CLAUDE_CODE_AUTO_COMPACT_WINDOW={val}; claudex forces this env var instead. Use CLAUDEX_AUTO_COMPACT_WINDOW=0 to disable compaction."
+        );
+    }
+
+    // Force Claude Code to auto-compact at the configured token window for every
+    // model/profile (default 262k). Override via CLAUDEX_AUTO_COMPACT_WINDOW.
+    // Clamped to the model's real context window so the cap never exceeds the model's
+    // actual capacity (prevents the provider's hard limit from firing before compaction).
+    // 0 in CLAUDEX_AUTO_COMPACT_WINDOW = disable; model context < 262k also disabled.
+    if let Some(compact_window) = resolve_compact_window(ctx.visible_model) {
+        cmd.env(
+            "CLAUDE_CODE_AUTO_COMPACT_WINDOW",
+            compact_window.to_string(),
+        );
+    }
 
     for (k, v) in &ctx.profile.extra_env {
         cmd.env(k, v);
@@ -359,15 +465,6 @@ fn claude_visible_model(model: &str, enable_openai_context_window: bool) -> Stri
     }
 }
 
-fn openai_model_auto_compact_window(model: &str) -> Option<u64> {
-    let model = strip_context_window_suffix(model);
-    match model {
-        model if is_large_context_gpt_model(model) => None,
-        model if is_openai_gpt_model(model) => Some(272_000),
-        _ => None,
-    }
-}
-
 fn strip_context_window_suffix(model: &str) -> &str {
     model
         .strip_suffix("[1m]")
@@ -398,10 +495,6 @@ fn is_large_context_gpt_model(model: &str) -> bool {
         .unwrap_or(0);
 
     major > 5 || major == 5 && minor > 5
-}
-
-fn is_openai_gpt_model(model: &str) -> bool {
-    model.starts_with("gpt-")
 }
 
 #[cfg(unix)]
@@ -579,17 +672,71 @@ mod tests {
     }
 
     #[test]
-    fn openai_model_auto_compact_window_does_not_limit_large_context_gpt_models() {
-        assert_eq!(openai_model_auto_compact_window("gpt-5.5"), None);
-        assert_eq!(openai_model_auto_compact_window("gpt-5.5[1m]"), None);
+    fn auto_compact_window_from_returns_option_and_clamps() {
+        // Unset → None (caller decides default).
+        assert_eq!(auto_compact_window_from(None), None);
+        // Explicit override is honored (clamped).
+        assert_eq!(auto_compact_window_from(Some("400000")), Some(400_000));
+        // Zero = explicit disable.
+        assert_eq!(auto_compact_window_from(Some("0")), Some(0));
+        // Garbage → None (not parseable).
+        assert_eq!(auto_compact_window_from(Some("garbage")), None);
+        // Huge values clamp to 1M so the cap cannot be silently disabled.
+        assert_eq!(auto_compact_window_from(Some("999999999")), Some(1_000_000));
+    }
+
+    #[test]
+    fn resolve_compact_window_handles_all_cases() {
+        // Test auto_compact_window_from (the env var resolution) and model context clamping
+        // directly, avoiding std::env::set_var which breaks parallel test isolation.
+        // auto_compact_window_from(None) → None (env unset, default path).
+        // auto_compact_window_from(Some("0")) → Some(0) (explicit disable).
+        // auto_compact_window_from(Some("500000")) → Some(500000) (clamped).
+        assert_eq!(auto_compact_window_from(None), None);
+        assert_eq!(auto_compact_window_from(Some("0")), Some(0));
+        assert_eq!(auto_compact_window_from(Some("500000")), Some(500_000));
+
+        // Model context clamping: clamped_compact_window respects the model's limit.
+        assert_eq!(clamped_compact_window("claude-sonnet-4", 500_000), 200_000);
+        assert_eq!(clamped_compact_window("gpt-5.5[1m]", 500_000), 500_000);
+        assert_eq!(clamped_compact_window("claude-sonnet-4", 100_000), 100_000);
+    }
+
+    #[test]
+    fn model_context_window_returns_correct_window_for_model_type() {
+        // Large-context GPT with [1m] → 1M
+        assert_eq!(model_context_window_for("gpt-5.5[1m]"), 1_000_000);
+        assert_eq!(model_context_window_for("gpt-5.6[1M]"), 1_000_000);
+        // Large-context GPT without suffix → 1M (auto-compact still clamps below)
+        assert_eq!(model_context_window_for("gpt-5.5"), 1_000_000);
+        assert_eq!(model_context_window_for("gpt-5.6"), 1_000_000);
+        // Claude → 200k
         assert_eq!(
-            openai_model_auto_compact_window("gpt-5.5-mini"),
-            Some(272_000)
+            model_context_window_for("claude-sonnet-4-20250514"),
+            200_000
         );
-        assert_eq!(openai_model_auto_compact_window("gpt-4o"), Some(272_000));
-        assert_eq!(openai_model_auto_compact_window("gpt-5.5-pro"), None);
-        assert_eq!(openai_model_auto_compact_window("gpt-5.6"), None);
-        assert_eq!(openai_model_auto_compact_window("claude-sonnet-4-6"), None);
+        assert_eq!(model_context_window_for("claude-opus-4-6"), 200_000);
+        // GPT-4o family → 128k
+        assert_eq!(model_context_window_for("gpt-4o"), 128_000);
+        assert_eq!(model_context_window_for("gpt-4o-mini"), 128_000);
+        // Gemini 2.5 → 1M
+        assert_eq!(model_context_window_for("gemini-2.5-pro"), 1_000_000);
+        // Kimi k2 → 128k
+        assert_eq!(model_context_window_for("kimi-k2-0905"), 128_000);
+        // Unknown → 262k default
+        assert_eq!(model_context_window_for("unknown-model"), 262_000);
+    }
+
+    #[test]
+    fn clamped_compact_window_respects_model_context() {
+        // User sets 500k → clamped to model context
+        assert_eq!(clamped_compact_window("claude-sonnet-4", 500_000), 200_000);
+        // User sets 100k → within model context, no clamp
+        assert_eq!(clamped_compact_window("claude-sonnet-4", 100_000), 100_000);
+        // Large-context GPT with [1m] → 1M context, user 500k stays 500k (but default 262k < 500k)
+        assert_eq!(clamped_compact_window("gpt-5.5[1m]", 500_000), 500_000);
+        // Default 262k clamped for small GPT → 128k
+        assert_eq!(clamped_compact_window("gpt-4o", 262_000), 128_000);
     }
 
     #[test]

@@ -363,3 +363,16 @@ profile = "local-qwen"              # reuse a profile's base_url + api_key for e
 model = "nomic-embed-text"           # embedding model
 chunk_size = 512
 top_k = 5
+
+# ─── OpenAI auto-compaction (optional) ─────────────────────
+# Applies to OpenAICompatible + OpenAIResponses profiles.
+# Enabled profiles get Claude Code's forced auto-compact window
+# (default 262k tokens, override with CLAUDEX_AUTO_COMPACT_WINDOW=0 to disable).
+#
+# If enabled, claudex also trims older messages client-side before
+# sending to the provider. Set reserve_tokens to match the model's window
+# (default 4096 is too low for large-window models — use 64000+).
+[profiles.openai_compatible_auto_compact]
+enabled = false
+max_items = 64
+reserve_tokens = 64000

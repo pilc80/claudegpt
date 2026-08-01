@@ -201,6 +201,12 @@ pub enum ConfigAction {
         #[arg(long)]
         connectivity: bool,
     },
+    /// Migrate config to the current canonical format (backs up first, reports dropped keys)
+    Migrate {
+        /// Apply the rewrite without prompting
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 #[derive(Subcommand)]

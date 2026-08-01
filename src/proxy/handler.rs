@@ -997,17 +997,41 @@ fn apply_openai_compatible_auto_compact(
     body: &mut Value,
     profile: &ProfileConfig,
 ) -> Option<ContextTelemetry> {
-    if profile.provider_type != ProviderType::OpenAICompatible
-        || !profile.openai_compatible_auto_compact.enabled
+    if !profile.openai_compatible_auto_compact.enabled {
+        return None;
+    }
+    // Skip auto-compaction for /compact requests — the user is about to summarize,
+    // trimming context would defeat the purpose.
+    if body
+        .get("messages")
+        .and_then(|m| m.as_array())
+        .is_some_and(|msgs| {
+            msgs.last().is_some_and(|last| {
+                let is_system = last.get("role").and_then(|r| r.as_str()) == Some("system");
+                last.get("content")
+                    .and_then(|c| c.as_str())
+                    .is_some_and(|c| {
+                        c.contains("/compact") || c.contains("compaction continuation")
+                    })
+                    || (is_system
+                        && last
+                            .get("content")
+                            .and_then(|c| c.as_str())
+                            .is_some_and(|c| {
+                                c.contains("/compact") || c.contains("compaction continuation")
+                            }))
+            })
+        })
     {
         return None;
     }
+
     let before_tokens = estimate_anthropic_input_tokens(body);
     let reserve_tokens = profile.openai_compatible_auto_compact.reserve_tokens;
-    let max_items = profile.openai_compatible_auto_compact.max_items.max(1);
+    let max_items = profile.openai_compatible_auto_compact.max_items;
     let mut removed_messages = 0usize;
     let mut summary = "none";
-    if before_tokens > reserve_tokens {
+    if max_items > 0 && before_tokens > reserve_tokens {
         if let Some(messages) = body
             .get_mut("messages")
             .and_then(|value| value.as_array_mut())
@@ -1017,13 +1041,38 @@ fn apply_openai_compatible_auto_compact(
                 removed_messages = keep_from;
                 messages.drain(0..keep_from);
                 summary = "truncated";
-                messages.insert(0, json!({
-                    "role": "user",
-                    "content": [{
-                        "type": "text",
-                        "text": format!("[claudex auto-compaction notice: omitted {} older message(s) before forwarding to OpenAI-compatible backend]", removed_messages)
-                    }]
-                }));
+                // Insert notice at position 0; if the first message is also role="user",
+                // merge into it rather than creating consecutive-user messages.
+                if let Some(first) = messages.first_mut() {
+                    if first.get("role").and_then(|r| r.as_str()) == Some("user") {
+                        if let Some(content) = first.get_mut("content") {
+                            if let Some(list) = content.as_array_mut() {
+                                let notice = json!({
+                                    "type": "text",
+                                    "text": format!("[claudex auto-compaction notice: omitted {} older message(s) before forwarding to {} backend]", removed_messages, provider_type_name(profile))
+                                });
+                                list.insert(0, notice);
+                            }
+                        }
+                    } else {
+                        messages.insert(0, json!({
+                            "role": "user",
+                            "content": [{
+                                "type": "text",
+                                "text": format!("[claudex auto-compaction notice: omitted {} older message(s) before forwarding to {} backend]", removed_messages, provider_type_name(profile))
+                            }]
+                        }));
+                    }
+                } else {
+                    // No messages left (edge case): insert as user message.
+                    messages.insert(0, json!({
+                        "role": "user",
+                        "content": [{
+                            "type": "text",
+                            "text": format!("[claudex auto-compaction notice: omitted {} older message(s) before forwarding to {} backend]", removed_messages, provider_type_name(profile))
+                        }]
+                    }));
+                }
             }
         }
     }
@@ -1038,15 +1087,25 @@ fn apply_openai_compatible_auto_compact(
     };
     tracing::info!(
         profile = %profile.name,
+        provider_type = %profile.provider_type,
         before_tokens,
         after_tokens,
         truncated = telemetry.truncated,
         summary,
         removed_messages,
         reserve_tokens,
-        "OpenAICompatible auto-compaction evaluated"
+        "auto-compaction evaluated"
     );
     Some(telemetry)
+}
+
+/// Return a human-readable provider type name for use in user-facing notices.
+fn provider_type_name(profile: &ProfileConfig) -> &'static str {
+    match profile.provider_type {
+        ProviderType::OpenAICompatible => "OpenAI-compatible",
+        ProviderType::OpenAIResponses => "Responses",
+        ProviderType::DirectAnthropic => "Anthropic",
+    }
 }
 
 fn safe_compaction_keep_from(messages: &[Value], max_items: usize) -> usize {
@@ -3242,20 +3301,108 @@ mod tests {
     }
 
     #[test]
-    fn test_auto_compact_skips_responses_profiles() {
-        let mut body =
-            json!({"messages": [{"role":"user","content":"old"},{"role":"user","content":"new"}]});
+    fn test_auto_compact_applies_to_responses_profiles() {
+        let mut body = json!({
+            "messages": [
+                {"role":"user","content":"old1"},
+                {"role":"assistant","content":"old2"},
+                {"role":"user","content":"new"}
+            ]
+        });
         let profile = ProfileConfig {
             provider_type: ProviderType::OpenAIResponses,
             openai_compatible_auto_compact: crate::config::OpenAICompatibleAutoCompact {
                 enabled: true,
                 max_items: 1,
-                reserve_tokens: 123,
+                reserve_tokens: 1,
             },
             ..ProfileConfig::default()
         };
-        assert!(apply_openai_compatible_auto_compact(&mut body, &profile).is_none());
-        assert_eq!(body["messages"].as_array().unwrap().len(), 2);
+        let telemetry = apply_openai_compatible_auto_compact(&mut body, &profile).unwrap();
+        assert_eq!(telemetry.removed_messages, 2);
+        assert!(telemetry.truncated);
+        assert!(
+            body["messages"].as_array().unwrap().last().unwrap()["content"]
+                .to_string()
+                .contains("new")
+        );
+    }
+
+    #[test]
+    fn test_auto_compact_merges_notice_into_first_user_message() {
+        // When the first retained message is role="user", the compaction notice
+        // should be appended to its content array (merged) instead of creating
+        // a new role="user" message (which would produce consecutive-user messages
+        // that strict OpenAI-compatible backends reject with 400).
+        //
+        // Setup: 3 messages, drain(0..2), only message[2] retained = role="user".
+        // Notice merges INTO the retained message's content (no new message created).
+        let mut body = json!({
+            "messages": [
+                {"role":"assistant","content":"assistant msg"},
+                {"role":"assistant","content":"more assistant"},
+                {"role":"user","content":[{"type":"text","text":"first user msg"}]}
+            ]
+        });
+        let profile = ProfileConfig {
+            provider_type: ProviderType::OpenAICompatible,
+            openai_compatible_auto_compact: crate::config::OpenAICompatibleAutoCompact {
+                enabled: true,
+                max_items: 1,
+                reserve_tokens: 1,
+            },
+            ..ProfileConfig::default()
+        };
+
+        let _telemetry = apply_openai_compatible_auto_compact(&mut body, &profile).unwrap();
+
+        // After drain(0..2): 1 message remains (the retained user message).
+        // Notice merged into its content array -> 2 entries.
+        assert_eq!(body["messages"].as_array().unwrap().len(), 1);
+        assert_eq!(body["messages"][0]["role"], "user");
+        let content_array = body["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(content_array.len(), 2);
+        assert!(content_array[0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("auto-compaction notice"));
+        assert_eq!(content_array[1]["text"], "first user msg");
+    }
+
+    #[test]
+    fn test_auto_compact_uses_different_notice_for_non_user_first_message() {
+        // When the first retained message is not role="user" (e.g. role="assistant"),
+        // the compaction notice should be inserted as a new role="user" message
+        // at position 0 (not merged).
+        let mut body = json!({
+            "messages": [
+                {"role":"assistant","content":"assistant msg"},
+                {"role":"assistant","content":"more assistant"},
+                {"role":"assistant","content":"third assistant"}
+            ]
+        });
+        let profile = ProfileConfig {
+            provider_type: ProviderType::OpenAIResponses,
+            openai_compatible_auto_compact: crate::config::OpenAICompatibleAutoCompact {
+                enabled: true,
+                max_items: 1,
+                reserve_tokens: 1,
+            },
+            ..ProfileConfig::default()
+        };
+
+        let _telemetry = apply_openai_compatible_auto_compact(&mut body, &profile).unwrap();
+
+        // keep_from=2, drain(0..2): first retained = last assistant (not user).
+        // -> notice inserted as new role="user" at [0] (no merge).
+        assert_eq!(body["messages"][0]["role"], "user"); // notice inserted as role="user"
+        assert!(
+            body["messages"][0]["content"].as_array().unwrap()[0]["text"]
+                .to_string()
+                .contains("auto-compaction notice")
+        );
+        // Original first assistant message is now at [1].
+        assert_eq!(body["messages"][1]["role"], "assistant");
     }
 
     #[test]
